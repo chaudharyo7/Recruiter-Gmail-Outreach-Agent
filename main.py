@@ -1,20 +1,29 @@
 import os
 import re
 import csv
+import sys
 import time
 import html
+import queue
 import base64
+import threading
+import concurrent.futures
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any, Optional, Set
 
 try:
-    from dotenv import load_dotenv
+    import openpyxl
+except ImportError:
+    openpyxl = None
+
+try:
+    from dotenv import load_dotenv, dotenv_values
     load_dotenv()
 except ImportError:
-    pass
+    dotenv_values = lambda *args, **kwargs: {}
 
 try:
     from google.auth.transport.requests import Request
@@ -29,24 +38,186 @@ except ImportError:
     build = None
     HttpError = Exception
 
-# Configuration
+# Centralized Configuration Loader and Parser Helpers
+def parse_bool(val: Any, default: bool = False) -> bool:
+    """Parse a boolean value from environment string representation."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ('true', '1', 'yes', 'y', 'on', 'enabled'):
+        return True
+    if s in ('false', '0', 'no', 'n', 'off', 'disabled', ''):
+        return False
+    return default
+
+
+def parse_int(val: Any, default: int, min_val: Optional[int] = None) -> int:
+    """Parse an integer value with optional lower bound constraint."""
+    try:
+        res = int(str(val).strip())
+        if min_val is not None and res < min_val:
+            return default
+        return res
+    except (ValueError, TypeError):
+        return default
+
+
+def parse_float(val: Any, default: float, min_val: Optional[float] = None) -> float:
+    """Parse a float value with optional lower bound constraint."""
+    try:
+        res = float(str(val).strip())
+        if min_val is not None and res < min_val:
+            return default
+        return res
+    except (ValueError, TypeError):
+        return default
+
+
+class Config:
+    """Centralized configuration loader and validator for Recruiter Outreach Agent.
+    Manages all settings from .env, falling back to sensible defaults.
+    """
+
+    def __init__(self, env_path: Optional[str] = None):
+        env_dict = {}
+        if env_path and os.path.exists(env_path):
+            env_dict = dotenv_values(env_path)
+        elif os.path.exists('.env'):
+            env_dict = dotenv_values('.env')
+
+        def get_val(key: str) -> Optional[str]:
+            if env_path is not None:
+                if key in env_dict and env_dict[key] is not None:
+                    return env_dict[key]
+                return os.getenv(key)
+            if key in os.environ and os.environ[key] is not None:
+                return os.environ[key]
+            if key in env_dict and env_dict[key] is not None:
+                return env_dict[key]
+            return None
+
+        # EMAIL CONFIGURATION
+        self.sender_email: Optional[str] = get_val('SENDER_EMAIL') or None
+        self.email_subject: Optional[str] = get_val('EMAIL_SUBJECT') or None
+
+        raw_template = get_val('EMAIL_TEMPLATE_FILE') or get_val('TEMPLATE_FILE')
+        self.email_template_file: str = self._resolve_path(
+            raw_template,
+            defaults=['templates/template.html']
+        )
+
+        raw_resume = get_val('RESUME_FILE')
+        self.resume_file: str = self._resolve_path(
+            raw_resume,
+            defaults=[
+                'attachments/Yamandeep_Chaudhary_Resume.pdf',
+                'attachments/resume.pdf'
+            ]
+        )
+
+        raw_csv = get_val('RECRUITER_CSV_FILE') or get_val('CSV_FILE')
+        self.recruiter_csv_file: str = self._resolve_path(
+            raw_csv,
+            defaults=['data/recruiter_contacts.csv']
+        )
+
+        # WORKERS & PERFORMANCE
+        self.num_workers: int = parse_int(get_val('NUM_WORKERS'), default=3, min_val=1)
+        self.max_retries: int = parse_int(get_val('MAX_RETRIES'), default=3, min_val=0)
+        self.retry_backoff_seconds: float = parse_float(get_val('RETRY_BACKOFF_SECONDS'), default=2.0, min_val=0.0)
+        self.gmail_api_request_delay: float = parse_float(get_val('GMAIL_API_REQUEST_DELAY'), default=0.0, min_val=0.0)
+
+        # EXCEL DIRECTORY
+        self.excel_directory_enabled: bool = parse_bool(get_val('EXCEL_DIRECTORY_ENABLED'), default=True)
+        self.excel_directory_file: str = get_val('EXCEL_DIRECTORY_FILE') or os.path.join('data', 'recruiter_email_backup.xlsx')
+
+        # BOUNCE DETECTION
+        self.bounce_check_enabled: bool = parse_bool(get_val('BOUNCE_CHECK_ENABLED'), default=True)
+        self.bounce_check_delay_seconds: int = parse_int(get_val('BOUNCE_CHECK_DELAY_SECONDS'), default=5, min_val=0)
+
+        # LOGGING
+        self.logging_enabled: bool = parse_bool(get_val('LOGGING_ENABLED'), default=True)
+        self.log_file: str = get_val('LOG_FILE') or os.path.join('logs', 'outreach.log')
+
+        # DASHBOARD
+        self.dashboard_enabled: bool = parse_bool(get_val('DASHBOARD_ENABLED'), default=True)
+        self.dashboard_refresh_rate: float = parse_float(get_val('DASHBOARD_REFRESH_RATE'), default=4.0, min_val=0.1)
+
+        # GMAIL API / OAUTH
+        raw_creds = get_val('GMAIL_CREDENTIALS_FILE') or get_val('CREDENTIALS_FILE')
+        self.gmail_credentials_file: str = self._resolve_path(
+            raw_creds,
+            defaults=['credentials.json', 'config/credentials.json']
+        )
+
+        raw_token = get_val('GMAIL_TOKEN_FILE') or get_val('TOKEN_FILE')
+        self.gmail_token_file: str = self._resolve_path(
+            raw_token,
+            defaults=['token.json', 'config/token.json']
+        )
+
+        # EXECUTION
+        self.dry_run: bool = parse_bool(get_val('DRY_RUN'), default=False)
+
+    @staticmethod
+    def _resolve_path(path: Optional[str], defaults: List[str]) -> str:
+        if path:
+            if os.path.exists(path):
+                return path
+            # Check candidate defaults if specified path does not exist
+            for candidate in defaults:
+                if os.path.exists(candidate):
+                    return candidate
+            return path
+        for candidate in defaults:
+            if os.path.exists(candidate):
+                return candidate
+        return defaults[0]
+
+    def validate(self) -> None:
+        """Validate paths and configuration parameters."""
+        if self.num_workers < 1:
+            raise ValueError(f"NUM_WORKERS must be an integer >= 1, got {self.num_workers}")
+        if self.max_retries < 0:
+            raise ValueError(f"MAX_RETRIES must be an integer >= 0, got {self.max_retries}")
+        if self.retry_backoff_seconds < 0:
+            raise ValueError(f"RETRY_BACKOFF_SECONDS must be >= 0, got {self.retry_backoff_seconds}")
+        if self.gmail_api_request_delay < 0:
+            raise ValueError(f"GMAIL_API_REQUEST_DELAY must be >= 0, got {self.gmail_api_request_delay}")
+        if self.dashboard_refresh_rate <= 0:
+            raise ValueError(f"DASHBOARD_REFRESH_RATE must be > 0, got {self.dashboard_refresh_rate}")
+        if self.bounce_check_delay_seconds < 0:
+            raise ValueError(f"BOUNCE_CHECK_DELAY_SECONDS must be >= 0, got {self.bounce_check_delay_seconds}")
+
+
+_CONFIG = Config()
+
+
+def get_config(env_path: Optional[str] = None) -> Config:
+    """Return the global configuration instance, or a fresh one if env_path is provided."""
+    global _CONFIG
+    if env_path is not None:
+        return Config(env_path=env_path)
+    return _CONFIG
+
+
+# Configuration constants maintained for module-level compatibility
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.send',
     'https://www.googleapis.com/auth/gmail.readonly'
 ]
-DEFAULT_CSV = os.getenv('CSV_FILE', os.path.join('data', 'recruiters.csv'))
-DEFAULT_TEMPLATE = os.getenv('TEMPLATE_FILE', os.path.join('templates', 'template.html'))
-DEFAULT_RESUME = os.getenv(
-    'RESUME_FILE',
-    os.path.join('attachments', 'Yamandeep_Chaudhary_Resume.pdf')
-    if os.path.exists(os.path.join('attachments', 'Yamandeep_Chaudhary_Resume.pdf'))
-    else os.path.join('attachments', 'resume.pdf')
-)
-CREDENTIALS_FILE = os.getenv('CREDENTIALS_FILE', os.path.join('config', 'credentials.json'))
-TOKEN_FILE = os.getenv('TOKEN_FILE', os.path.join('config', 'token.json'))
-LOG_DIR = 'logs'
-LOG_FILE = os.getenv('LOG_FILE', os.path.join(LOG_DIR, 'outreach.log'))
-BOUNCE_CHECK_DELAY_SECONDS = int(os.getenv('BOUNCE_CHECK_DELAY_SECONDS', '5'))
+DEFAULT_CSV = _CONFIG.recruiter_csv_file
+DEFAULT_TEMPLATE = _CONFIG.email_template_file
+DEFAULT_RESUME = _CONFIG.resume_file
+CREDENTIALS_FILE = _CONFIG.gmail_credentials_file
+TOKEN_FILE = _CONFIG.gmail_token_file
+LOG_DIR = os.path.dirname(_CONFIG.log_file) or 'logs'
+LOG_FILE = _CONFIG.log_file
+BOUNCE_CHECK_DELAY_SECONDS = _CONFIG.bounce_check_delay_seconds
+DEFAULT_EXCEL_DIRECTORY = _CONFIG.excel_directory_file
+NUM_WORKERS = _CONFIG.num_workers
 
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 SUBJECT_REGEX = re.compile(r'<!--\s*Subject:\s*(.+?)\s*-->', re.IGNORECASE)
@@ -94,6 +265,7 @@ class OutreachLogger:
 
     def __init__(self, log_path: Optional[str] = None):
         self.log_path = log_path or LOG_FILE
+        self._lock = threading.Lock()
         log_dir = os.path.dirname(self.log_path)
         if log_dir:
             os.makedirs(log_dir, exist_ok=True)
@@ -104,26 +276,37 @@ class OutreachLogger:
 
     def log_email_record(self, record: Dict[str, Any]) -> None:
         """Append exactly one physical log line for an email."""
-        ts = record.get('timestamp') or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        sub_time = record.get('submitted_time')
-        if not sub_time or sub_time == "None":
-            if record.get('status') in ('SUBMITTED', 'UNKNOWN'):
-                sub_time = ts.split(' ')[1] if ' ' in ts else ts
-            else:
-                sub_time = "N/A"
+        self.log_email_records([record])
 
-        line = format_email_log_line(
-            timestamp=ts,
-            recipient=record['recipient'],
-            status=record['status'],
-            subject=record.get('subject') or "N/A",
-            message_id=record.get('message_id') or "N/A",
-            submitted_time=sub_time,
-            bounce_time=record.get('bounce_time') or "N/A",
-            error=record.get('error') or "None"
-        )
-        with open(self.log_path, 'a', encoding='utf-8') as f:
-            f.write(line + "\n")
+    def log_email_records(self, records: List[Dict[str, Any]]) -> None:
+        """Batch append multiple email records in a single disk I/O write."""
+        if not records:
+            return
+        lines = []
+        for record in records:
+            ts = record.get('timestamp') or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            sub_time = record.get('submitted_time')
+            if not sub_time or sub_time == "None":
+                if record.get('status') in ('SUBMITTED', 'UNKNOWN'):
+                    sub_time = ts.split(' ')[1] if ' ' in ts else ts
+                else:
+                    sub_time = "N/A"
+
+            line = format_email_log_line(
+                timestamp=ts,
+                recipient=record['recipient'],
+                status=record['status'],
+                subject=record.get('subject') or "N/A",
+                message_id=record.get('message_id') or "N/A",
+                submitted_time=sub_time,
+                bounce_time=record.get('bounce_time') or "N/A",
+                error=record.get('error') or "None"
+            )
+            lines.append(line + "\n")
+
+        with self._lock:
+            with open(self.log_path, 'a', encoding='utf-8') as f:
+                f.writelines(lines)
 
     def update_email_record(
         self,
@@ -135,93 +318,118 @@ class OutreachLogger:
         subject: Optional[str] = None,
         remark: Optional[str] = None
     ) -> bool:
+        """Update an existing email record line in outreach.log in-place."""
+        eff_err = error if error and error != "None" else (remark if remark and remark != "None" else "None")
+        updates = {
+            recipient.lower().strip(): {
+                'new_status': new_status,
+                'error': eff_err,
+                'bounce_time': bounce_time,
+                'message_id': message_id,
+                'subject': subject
+            }
+        }
+        return self.batch_update_email_records(updates) > 0
+
+    def batch_update_email_records(self, updates_by_email: Dict[str, Dict[str, Any]]) -> int:
         """
-        Update an existing email record line in outreach.log in-place.
+        Batch update multiple email records in a single read-write file pass.
         Preserves original submission timestamp, subject, and message_id.
-        Ensures exactly one line per email across status changes.
+        Key is lowercase recipient email address.
         """
-        if not os.path.exists(self.log_path):
-            return False
+        if not os.path.exists(self.log_path) or not updates_by_email:
+            return 0
 
-        with open(self.log_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        with self._lock:
+            with open(self.log_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
 
-        target_email = recipient.lower().strip()
-        updated = False
+            pending_updates = {k.lower().strip(): v for k, v in updates_by_email.items()}
+            updated_count = 0
+            now_time = datetime.now().strftime('%H:%M:%S')
 
-        # Search in reverse to update the most recent record for this recipient
-        for idx in range(len(lines) - 1, -1, -1):
-            line = lines[idx]
-            parts = [p.strip() for p in line.split('|')]
-            if len(parts) >= 3:
-                line_recipient = parts[1].lower().strip()
-                if line_recipient == target_email:
-                    orig_timestamp = parts[0]
+            # Scan in reverse to update the most recent record for each recipient
+            for idx in range(len(lines) - 1, -1, -1):
+                line = lines[idx]
+                parts = [p.strip() for p in line.split('|')]
+                if len(parts) >= 3:
+                    line_recipient = parts[1].lower().strip()
+                    if line_recipient in pending_updates:
+                        upd = pending_updates[line_recipient]
+                        orig_timestamp = parts[0]
 
-                    # Extract Subject
-                    orig_subj = subject
-                    if not orig_subj:
-                        for p in parts[3:]:
-                            if p.startswith('Subject:'):
-                                orig_subj = re.sub(r'^Subject:\s*', '', p).strip()
-                                break
-                    if not orig_subj:
-                        orig_subj = "N/A"
-
-                    # Extract Message ID
-                    orig_mid = message_id
-                    if not orig_mid or orig_mid == "N/A":
-                        for p in parts[3:]:
-                            if p.startswith('ID:') or p.startswith('Message-ID:'):
-                                extracted_id = re.sub(r'^(?:ID|Message-ID):\s*', '', p).strip()
-                                if extracted_id and extracted_id != "N/A":
-                                    orig_mid = extracted_id
+                        # Extract Subject
+                        orig_subj = upd.get('subject')
+                        if not orig_subj or orig_subj == "N/A":
+                            for p in parts[3:]:
+                                if p.startswith('Subject:'):
+                                    orig_subj = re.sub(r'^Subject:\s*', '', p).strip()
                                     break
-                    if not orig_mid:
-                        orig_mid = "N/A"
+                        if not orig_subj:
+                            orig_subj = "N/A"
 
-                    # Extract Submitted time
-                    orig_sub_time = "N/A"
-                    for p in parts[3:]:
-                        if p.startswith('Submitted:'):
-                            orig_sub_time = re.sub(r'^Submitted:\s*', '', p).strip()
-                            break
-                    if orig_sub_time == "N/A" and ('SUBMITTED' in parts[2] or new_status in ('SUBMITTED', 'UNKNOWN', 'BOUNCED')):
-                        orig_sub_time = orig_timestamp.split(' ')[1] if ' ' in orig_timestamp else orig_timestamp
+                        # Extract Message ID
+                        orig_mid = upd.get('message_id')
+                        if not orig_mid or orig_mid == "N/A":
+                            for p in parts[3:]:
+                                if p.startswith('ID:') or p.startswith('Message-ID:'):
+                                    extracted_id = re.sub(r'^(?:ID|Message-ID):\s*', '', p).strip()
+                                    if extracted_id and extracted_id != "N/A":
+                                        orig_mid = extracted_id
+                                        break
+                        if not orig_mid:
+                            orig_mid = "N/A"
 
-                    # Determine bounce_time
-                    cur_bounce = "N/A"
-                    if bounce_time:
-                        cur_bounce = bounce_time
-                    elif new_status == 'BOUNCED':
-                        cur_bounce = datetime.now().strftime('%H:%M:%S')
-                    else:
+                        # Extract Submitted time
+                        orig_sub_time = "N/A"
                         for p in parts[3:]:
-                            if p.startswith('Bounce:') or p.startswith('Bounce-Time:'):
-                                cur_bounce = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
+                            if p.startswith('Submitted:'):
+                                orig_sub_time = re.sub(r'^Submitted:\s*', '', p).strip()
                                 break
+                        new_status = upd.get('new_status', parts[2])
+                        if orig_sub_time == "N/A" and ('SUBMITTED' in parts[2] or new_status in ('SUBMITTED', 'UNKNOWN', 'BOUNCED')):
+                            orig_sub_time = orig_timestamp.split(' ')[1] if ' ' in orig_timestamp else orig_timestamp
 
-                    eff_error = error if error and error != "None" else (remark if remark and remark != "None" else "None")
+                        # Determine bounce_time
+                        cur_bounce = "N/A"
+                        if upd.get('bounce_time'):
+                            cur_bounce = upd['bounce_time']
+                        elif new_status == 'BOUNCED':
+                            cur_bounce = now_time
+                        else:
+                            for p in parts[3:]:
+                                if p.startswith('Bounce:') or p.startswith('Bounce-Time:'):
+                                    cur_bounce = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
+                                    break
 
-                    updated_line = format_email_log_line(
-                        timestamp=orig_timestamp,
-                        recipient=parts[1],
-                        status=new_status,
-                        subject=orig_subj,
-                        message_id=orig_mid,
-                        submitted_time=orig_sub_time,
-                        bounce_time=cur_bounce,
-                        error=eff_error
-                    )
-                    lines[idx] = updated_line + "\n"
-                    updated = True
-                    break
+                        eff_error = upd.get('error', 'None')
+                        if not eff_error or eff_error == "None":
+                            rem = upd.get('remark')
+                            if rem and rem != "None":
+                                eff_error = rem
+                            else:
+                                eff_error = "None"
 
-        if updated:
-            with open(self.log_path, 'w', encoding='utf-8') as f:
-                f.writelines(lines)
+                        lines[idx] = format_email_log_line(
+                            timestamp=orig_timestamp,
+                            recipient=parts[1],
+                            status=new_status,
+                            subject=orig_subj,
+                            message_id=orig_mid,
+                            submitted_time=orig_sub_time,
+                            bounce_time=cur_bounce,
+                            error=eff_error
+                        ) + "\n"
+                        updated_count += 1
+                        del pending_updates[line_recipient]
+                        if not pending_updates:
+                            break
 
-        return updated
+            if updated_count > 0:
+                with open(self.log_path, 'w', encoding='utf-8') as f:
+                    f.writelines(lines)
+
+            return updated_count
 
     def get_unconfirmed_records(self) -> List[Dict[str, Any]]:
         """Retrieve previously logged records with SUBMITTED or UNKNOWN status for delayed bounce checks."""
@@ -229,39 +437,282 @@ class OutreachLogger:
             return []
 
         unconfirmed = []
-        with open(self.log_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = [p.strip() for p in line.split('|')]
-                if len(parts) >= 3:
-                    status = parts[2]
-                    bounce_str = "N/A"
-                    for p in parts[3:]:
-                        if p.startswith('Bounce:') or p.startswith('Bounce-Time:'):
-                            bounce_str = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
-                            break
-
-                    if status in ('SUBMITTED', 'UNKNOWN') and bounce_str == 'N/A':
-                        mid = "N/A"
-                        subj = "N/A"
-                        sub_time = "N/A"
+        with self._lock:
+            with open(self.log_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = [p.strip() for p in line.split('|')]
+                    if len(parts) >= 3:
+                        status = parts[2]
+                        bounce_str = "N/A"
                         for p in parts[3:]:
-                            if p.startswith('ID:') or p.startswith('Message-ID:'):
-                                mid = re.sub(r'^(?:ID|Message-ID):\s*', '', p).strip()
-                            elif p.startswith('Subject:'):
-                                subj = re.sub(r'^Subject:\s*', '', p).strip()
-                            elif p.startswith('Submitted:'):
-                                sub_time = re.sub(r'^Submitted:\s*', '', p).strip()
+                            if p.startswith('Bounce:') or p.startswith('Bounce-Time:'):
+                                bounce_str = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
+                                break
 
-                        unconfirmed.append({
-                            'timestamp': parts[0],
-                            'recipient': parts[1],
-                            'status': status,
-                            'subject': subj,
-                            'message_id': mid,
-                            'submitted_time': sub_time,
-                            'bounce_time': 'N/A'
-                        })
+                        if status in ('SUBMITTED', 'UNKNOWN') and bounce_str == 'N/A':
+                            mid = "N/A"
+                            subj = "N/A"
+                            sub_time = "N/A"
+                            for p in parts[3:]:
+                                if p.startswith('ID:') or p.startswith('Message-ID:'):
+                                    mid = re.sub(r'^(?:ID|Message-ID):\s*', '', p).strip()
+                                elif p.startswith('Subject:'):
+                                    subj = re.sub(r'^Subject:\s*', '', p).strip()
+                                elif p.startswith('Submitted:'):
+                                    sub_time = re.sub(r'^Submitted:\s*', '', p).strip()
+
+                            unconfirmed.append({
+                                'timestamp': parts[0],
+                                'recipient': parts[1],
+                                'status': status,
+                                'subject': subj,
+                                'message_id': mid,
+                                'submitted_time': sub_time,
+                                'bounce_time': 'N/A',
+                                'remark': 'No bounce detected; delivery unconfirmed',
+                                'error': 'None'
+                            })
         return unconfirmed
+
+
+class RecruiterDirectory:
+    """Thread-safe public recruiter email directory saved to data/recruiter_email_backup.xlsx.
+    Maintains a single 'Email' column with case-insensitively deduplicated addresses.
+    Preserves existing entries between runs.
+    """
+
+    def __init__(self, excel_path: str = DEFAULT_EXCEL_DIRECTORY):
+        self.excel_path = excel_path
+        self._lock = threading.Lock()
+        self._emails_lower: Set[str] = set()
+        self._init_file()
+
+    def _init_file(self) -> None:
+        if openpyxl is None:
+            return
+        with self._lock:
+            parent = os.path.dirname(os.path.abspath(self.excel_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            if os.path.exists(self.excel_path):
+                wb = None
+                try:
+                    wb = openpyxl.load_workbook(self.excel_path)
+                    ws = wb.active
+                    for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+                        val = row[0]
+                        if val and isinstance(val, str) and val.strip():
+                            self._emails_lower.add(val.strip().lower())
+                    return
+                except Exception:
+                    pass
+                finally:
+                    if wb:
+                        wb.close()
+            wb = openpyxl.Workbook()
+            try:
+                ws = wb.active
+                ws.title = "Recruiters"
+                ws.cell(row=1, column=1, value="Email")
+                wb.save(self.excel_path)
+            finally:
+                wb.close()
+
+    def add_email(self, email_str: str) -> bool:
+        """Add a submitted email to the Excel directory if not already present (case-insensitive).
+        Thread-safe. Returns True if added, False if duplicate or skipped.
+        """
+        if openpyxl is None:
+            return False
+        clean = email_str.strip()
+        lower = clean.lower()
+        if not lower:
+            return False
+
+        with self._lock:
+            if lower in self._emails_lower:
+                return False
+
+            wb = None
+            try:
+                if os.path.exists(self.excel_path):
+                    wb = openpyxl.load_workbook(self.excel_path)
+                    ws = wb.active
+                else:
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "Recruiters"
+                    ws.cell(row=1, column=1, value="Email")
+
+                if ws.cell(row=1, column=1).value != "Email":
+                    ws.cell(row=1, column=1, value="Email")
+
+                next_row = ws.max_row + 1
+                ws.cell(row=next_row, column=1, value=clean)
+                wb.save(self.excel_path)
+                self._emails_lower.add(lower)
+                return True
+            except Exception:
+                return False
+            finally:
+                if wb:
+                    wb.close()
+
+    def get_all_emails(self) -> List[str]:
+        """Return all emails currently stored in the directory."""
+        if openpyxl is None or not os.path.exists(self.excel_path):
+            return []
+        with self._lock:
+            wb = None
+            try:
+                wb = openpyxl.load_workbook(self.excel_path)
+                ws = wb.active
+                emails = []
+                for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+                    val = row[0]
+                    if val and isinstance(val, str) and val.strip():
+                        emails.append(val.strip())
+                return emails
+            except Exception:
+                return []
+            finally:
+                if wb:
+                    wb.close()
+
+
+class LiveDashboard:
+    """Thread-safe live terminal dashboard tracking workers, progress, and counters."""
+
+    def __init__(
+        self,
+        total_recipients: int,
+        is_live: Optional[bool] = None,
+        num_workers: int = 3,
+        refresh_rate: float = 4.0
+    ):
+        self.total_recipients = max(0, total_recipients)
+        self.is_live = sys.stdout.isatty() if is_live is None else is_live
+        self.num_workers = max(1, num_workers)
+        self.min_render_interval = 1.0 / max(0.1, refresh_rate)
+        self._lock = threading.Lock()
+        self.start_time = time.time()
+        self.completed = 0
+        self.last_render_time = 0.0
+        self.lines_rendered = 0
+
+        # Worker panels configured for num_workers
+        self.workers: Dict[int, Dict[str, str]] = {
+            i: {'state': 'IDLE', 'recipient': '-'}
+            for i in range(1, self.num_workers + 1)
+        }
+
+        # Counters
+        self.counters: Dict[str, int] = {
+            'SUBMITTED': 0,
+            'INVALID': 0,
+            'FAILED_TO_SUBMIT': 0,
+            'BOUNCED': 0,
+            'UNKNOWN': 0,
+            'SKIPPED': 0
+        }
+
+    def update_worker(self, worker_id: int, state: str, recipient: str) -> None:
+        with self._lock:
+            if worker_id in self.workers:
+                self.workers[worker_id]['state'] = state
+                self.workers[worker_id]['recipient'] = recipient if recipient else '-'
+            self._render_locked()
+
+    def increment_counter(self, counter_name: str, delta: int = 1) -> None:
+        with self._lock:
+            if counter_name in self.counters:
+                self.counters[counter_name] += delta
+            self._render_locked()
+
+    def set_counter(self, counter_name: str, value: int) -> None:
+        with self._lock:
+            if counter_name in self.counters:
+                self.counters[counter_name] = value
+            self._render_locked()
+
+    def record_completed(self) -> None:
+        with self._lock:
+            self.completed += 1
+            self._render_locked()
+
+    def _render_locked(self, force: bool = False) -> None:
+        now = time.time()
+        if not force and (now - self.last_render_time) < self.min_render_interval:
+            return
+        self.last_render_time = now
+
+        if not self.is_live:
+            return
+
+        elapsed = max(0.001, now - self.start_time)
+        rate = (self.completed / elapsed) * 60.0
+        pct = (self.completed / self.total_recipients * 100.0) if self.total_recipients > 0 else 100.0
+        mins, secs = divmod(int(elapsed), 60)
+        elapsed_str = f"{mins:02d}:{secs:02d}"
+
+        bar_len = 25
+        filled = int(bar_len * (self.completed / self.total_recipients)) if self.total_recipients > 0 else bar_len
+        bar = "█" * filled + "░" * (bar_len - filled)
+
+        lines = [
+            "======================= Recruiter Outreach Live Dashboard =======================",
+            f"Progress: [{bar}] {self.completed}/{self.total_recipients} ({pct:.1f}%) | Time: {elapsed_str} | Rate: {rate:.1f} msg/min",
+            "--------------------------------- Worker Panels ---------------------------------"
+        ]
+        for w_id in range(1, self.num_workers + 1):
+            w = self.workers.get(w_id, {'state': 'IDLE', 'recipient': '-'})
+            lines.append(f" [Worker {w_id}] State: {w['state']:<10} | Current: {w['recipient']}")
+
+        lines.extend([
+            "------------------------------------ Counters -----------------------------------",
+            f" SUBMITTED: {self.counters['SUBMITTED']} | INVALID: {self.counters['INVALID']} | FAILED_TO_SUBMIT: {self.counters['FAILED_TO_SUBMIT']} | BOUNCED: {self.counters['BOUNCED']} | UNKNOWN: {self.counters['UNKNOWN']} | SKIPPED: {self.counters['SKIPPED']}",
+            "================================================================================="
+        ])
+
+        if self.lines_rendered > 0:
+            sys.stdout.write(f"\033[{self.lines_rendered}A")
+        for line in lines:
+            sys.stdout.write(f"\033[2K\r{line}\n")
+        sys.stdout.flush()
+        self.lines_rendered = len(lines)
+
+    def render_final_summary(self, log_path: str = LOG_FILE, excel_path: str = DEFAULT_EXCEL_DIRECTORY) -> None:
+        with self._lock:
+            self._render_locked(force=True)
+            elapsed = max(0.001, time.time() - self.start_time)
+            rate = (self.completed / elapsed) * 60.0
+            pct = (self.completed / self.total_recipients * 100.0) if self.total_recipients > 0 else 100.0
+            mins, secs = divmod(int(elapsed), 60)
+            elapsed_str = f"{mins:02d}:{secs:02d}"
+
+            summary = [
+                "",
+                "=========================== Final Execution Summary ===========================",
+                f"Total Recipients:     {self.total_recipients}",
+                f"Processed:            {self.completed}",
+                f"Progress:             {pct:.1f}%",
+                f"Elapsed Time:         {elapsed_str}",
+                f"Processing Rate:      {rate:.1f} emails/min",
+                "",
+                "--- Status Counters ---",
+                f"SUBMITTED:            {self.counters['SUBMITTED']}",
+                f"BOUNCED:              {self.counters['BOUNCED']}",
+                f"UNKNOWN:              {self.counters['UNKNOWN']}",
+                f"FAILED_TO_SUBMIT:     {self.counters['FAILED_TO_SUBMIT']}",
+                f"INVALID:              {self.counters['INVALID']}",
+                f"SKIPPED:              {self.counters['SKIPPED']}",
+                "",
+                f"Logs:                 {log_path}",
+                f"Public Directory:     {excel_path}",
+                "===============================================================================",
+                ""
+            ]
+            print("\n".join(summary))
 
 
 def parse_template(template_path: str) -> Tuple[str, str]:
@@ -299,23 +750,37 @@ def is_valid_email(email_str: str) -> bool:
     return bool(EMAIL_REGEX.match(email_str.strip()))
 
 
-def get_gmail_service():
+def get_gmail_service(
+    credentials_file: Optional[str] = None,
+    token_file: Optional[str] = None
+):
     """Authenticate and return Gmail API service instance."""
     if None in (Request, Credentials, InstalledAppFlow, build):
         raise ImportError(
             "Missing Google client libraries. Run 'pip install -r requirements.txt' first."
         )
 
+    cfg = get_config()
+    creds_path = credentials_file or cfg.gmail_credentials_file
+    tok_path = token_file or cfg.gmail_token_file
+
+    # Fallback to config/ if not found in root
+    if not os.path.exists(creds_path) and os.path.exists(os.path.join('config', 'credentials.json')):
+        creds_path = os.path.join('config', 'credentials.json')
+
+    if not os.path.exists(tok_path) and os.path.exists(os.path.join('config', 'token.json')):
+        tok_path = os.path.join('config', 'token.json')
+
     creds = None
-    if os.path.exists(TOKEN_FILE):
+    if os.path.exists(tok_path):
         try:
             import json
-            with open(TOKEN_FILE, 'r', encoding='utf-8') as tf:
+            with open(tok_path, 'r', encoding='utf-8') as tf:
                 token_data = json.load(tf)
             stored_scopes = set(token_data.get('scopes', []))
             # Verify stored token actually grants every required scope in SCOPES
             if set(SCOPES).issubset(stored_scopes):
-                creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+                creds = Credentials.from_authorized_user_file(tok_path, SCOPES)
             else:
                 creds = None
         except Exception:
@@ -325,83 +790,176 @@ def get_gmail_service():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            if not os.path.exists(CREDENTIALS_FILE):
+            if not os.path.exists(creds_path):
                 raise FileNotFoundError(
-                    f"'{CREDENTIALS_FILE}' not found. Please download OAuth client credentials "
+                    f"'{creds_path}' not found. Please download OAuth client credentials "
                     "from Google Cloud Console and place them in config/credentials.json."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
+            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
             creds = flow.run_local_server(port=0)
 
-        token_dir = os.path.dirname(TOKEN_FILE)
+        token_dir = os.path.dirname(tok_path)
         if token_dir:
             os.makedirs(token_dir, exist_ok=True)
-        with open(TOKEN_FILE, 'w') as token_file:
+        with open(tok_path, 'w') as token_file:
             token_file.write(creds.to_json())
 
-    return build('gmail', 'v1', credentials=creds)
+    service = build('gmail', 'v1', credentials=creds)
+    service._agent_credentials = creds
+    _THREAD_LOCAL.service = service
+    return service
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def get_thread_safe_service(base_service):
+    """Return a thread-isolated Gmail API service client.
+    Each thread gets its own Resource instance and independent httplib2.Http transport,
+    preventing C-level SSL heap corruption in libmalloc on macOS ARM64.
+    If base_service is a mock, None, or lacks credentials, returns base_service directly.
+    """
+    if base_service is None:
+        return None
+
+    # Transparent mock compatibility for unit tests
+    if (
+        hasattr(base_service, '_mock_return_value')
+        or hasattr(base_service, 'mock_calls')
+        or hasattr(base_service, 'assert_called_with')
+    ):
+        return base_service
+
+    # Check credentials
+    creds = getattr(base_service, '_agent_credentials', None)
+    if not creds:
+        creds = getattr(base_service, '_credentials', None)
+
+    if not creds or build is None:
+        return base_service
+
+    thread_service = getattr(_THREAD_LOCAL, 'service', None)
+    if thread_service is None:
+        try:
+            thread_service = build('gmail', 'v1', credentials=creds)
+            thread_service._agent_credentials = creds
+            _THREAD_LOCAL.service = thread_service
+        except Exception:
+            return base_service
+
+    return thread_service
+
+
+def read_raw_recruiter_emails(csv_path: str) -> List[str]:
+    """Read all raw recipient entries from CSV file in row order, preserving order and duplicates."""
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    emails: List[str] = []
+    with open(csv_path, mode='r', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            return emails
+
+        first_row_clean = [col.strip().lower() for col in first_row]
+        email_col_idx = 0
+        has_header = False
+
+        if any('email' in col or 'mail' in col or 'recipient' in col for col in first_row_clean):
+            has_header = True
+            for idx, col in enumerate(first_row_clean):
+                if 'email' in col or 'mail' in col or 'recipient' in col:
+                    email_col_idx = idx
+                    break
+
+        # Process first row if it was data rather than header
+        if not has_header and first_row:
+            val = first_row[0].strip()
+            if val:
+                emails.append(val)
+
+        for row in reader:
+            if not row or len(row) <= email_col_idx:
+                continue
+            val = row[email_col_idx].strip()
+            if val:
+                emails.append(val)
+
+    return emails
 
 
 def read_recruiter_emails(csv_path: str) -> Tuple[List[str], List[str]]:
     """
-    Read recruiter emails from CSV file.
-    Validates format and returns (valid_emails, invalid_emails).
+    Read recruiter emails from CSV file in a single streaming pass.
+    Validates format, eliminates duplicates, and returns (valid_emails, invalid_emails).
     """
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"CSV file not found: {csv_path}")
-
+    raw_list = read_raw_recruiter_emails(csv_path)
     valid_emails = []
     invalid_emails = []
+    seen = set()
 
-    with open(csv_path, mode='r', encoding='utf-8') as f:
-        reader = csv.reader(f)
-        rows = list(reader)
-
-        if not rows:
-            return valid_emails, invalid_emails
-
-        first_row = [col.strip().lower() for col in rows[0]]
-        email_col_idx = 0
-        start_row_idx = 0
-
-        if any('email' in col or 'mail' in col for col in first_row):
-            start_row_idx = 1
-            for idx, col in enumerate(first_row):
-                if 'email' in col or 'mail' in col:
-                    email_col_idx = idx
-                    break
-
-        for row in rows[start_row_idx:]:
-            if not row or len(row) <= email_col_idx:
-                continue
-            email_val = row[email_col_idx].strip()
-            if not email_val:
-                continue
-
-            if is_valid_email(email_val):
-                valid_emails.append(email_val)
-            else:
-                invalid_emails.append(email_val)
+    for email_val in raw_list:
+        norm = email_val.lower()
+        if norm in seen:
+            continue
+        seen.add(norm)
+        if is_valid_email(email_val):
+            valid_emails.append(email_val)
+        else:
+            invalid_emails.append(email_val)
 
     return valid_emails, invalid_emails
 
 
-def create_message(to_email: str, subject: str, html_content: str, resume_path: str) -> dict:
-    """Create a MIME message with HTML body and PDF attachment, encoded for Gmail API."""
+_RESUME_CACHE: Dict[str, Tuple[str, bytes]] = {}
+_RESUME_CACHE_LOCK = threading.Lock()
+
+
+def get_cached_resume(resume_path: str) -> Tuple[str, bytes]:
+    """Retrieve filename and bytes of resume, caching in-memory to prevent repeated disk reads."""
+    with _RESUME_CACHE_LOCK:
+        if resume_path in _RESUME_CACHE:
+            return _RESUME_CACHE[resume_path]
+    with open(resume_path, 'rb') as f:
+        data = f.read()
+    filename = os.path.basename(resume_path)
+    with _RESUME_CACHE_LOCK:
+        _RESUME_CACHE[resume_path] = (filename, data)
+    return filename, data
+
+
+def create_message(
+    to_email: str,
+    subject: str,
+    html_content: str,
+    resume_path: str,
+    resume_data: Optional[Tuple[str, bytes]] = None,
+    from_email: Optional[str] = None
+) -> dict:
+    """Create a MIME message with HTML body and PDF attachment, encoded for Gmail API.
+    Reuses in-memory cached resume binary data to eliminate redundant disk reads.
+    """
     message = MIMEMultipart()
     message['to'] = to_email
+    if from_email:
+        message['from'] = from_email
     message['subject'] = subject
 
     # Attach HTML body
     body_part = MIMEText(html_content, 'html', 'utf-8')
     message.attach(body_part)
 
-    # Attach resume PDF
-    with open(resume_path, 'rb') as f:
-        attachment = MIMEApplication(f.read(), _subtype='pdf')
-        filename = os.path.basename(resume_path)
-        attachment.add_header('Content-Disposition', 'attachment', filename=filename)
-        message.attach(attachment)
+    # Attach resume PDF using cached bytes
+    if resume_data is not None:
+        filename, data = resume_data
+    else:
+        filename, data = get_cached_resume(resume_path)
+
+    attachment = MIMEApplication(data, _subtype='pdf')
+    attachment.add_header('Content-Disposition', 'attachment', filename=filename)
+    message.attach(attachment)
 
     raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode('utf-8')
     return {'raw': raw_message}
@@ -499,21 +1057,61 @@ def parse_bounce_notification(msg_full: dict) -> Optional[Dict[str, Any]]:
     }
 
 
+def execute_with_retry(
+    api_call_fn,
+    max_retries: int = 3,
+    initial_delay: float = 0.4,
+    backoff_factor: float = 2.0
+) -> Any:
+    """Execute an API call with exponential backoff for transient errors.
+    Retries on HTTP 429 (rate limit), 500, 502, 503, 504, and transient network errors.
+    Never retries permanent failures (HTTP 400, 401, 403, 404).
+    """
+    delay = initial_delay
+    last_err = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            return api_call_fn()
+        except HttpError as error:
+            status_code = getattr(getattr(error, 'resp', None), 'status', None)
+            if status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                time.sleep(delay)
+                delay *= backoff_factor
+                last_err = error
+                continue
+            raise
+        except (ConnectionError, TimeoutError, OSError) as error:
+            if attempt < max_retries:
+                time.sleep(delay)
+                delay *= backoff_factor
+                last_err = error
+                continue
+            raise
+
+    if last_err:
+        raise last_err
+
+
 def detect_bounces(
     service,
     submitted_records: List[Dict[str, Any]],
     logger: Optional[OutreachLogger] = None,
     delay_seconds: int = 0,
-    cached_bounces: Optional[List[Dict[str, Any]]] = None
+    cached_bounces: Optional[List[Dict[str, Any]]] = None,
+    config: Optional[Config] = None
 ) -> List[Dict[str, Any]]:
     """
     Check Gmail inbox for delivery failure notifications from mailer-daemon,
     mail delivery subsystem, or postmaster.
+    Uses concurrent message retrieval and batch logging for high performance.
     Matches notifications to submitted records, updates status to BOUNCED or UNKNOWN,
     and updates outreach.log in-place without duplicate records.
     """
     if not submitted_records:
         return submitted_records
+
+    cfg = config or get_config()
 
     if cached_bounces is not None and len(cached_bounces) > 0:
         bounces = cached_bounces
@@ -522,65 +1120,84 @@ def detect_bounces(
             time.sleep(delay_seconds)
 
         query = 'from:(mailer-daemon OR "Mail Delivery Subsystem" OR postmaster)'
+        svc = get_thread_safe_service(service)
         try:
-            resp = service.users().messages().list(userId='me', q=query, maxResults=50).execute()
+            resp = execute_with_retry(
+                lambda: svc.users().messages().list(userId='me', q=query, maxResults=50).execute()
+            )
             messages = resp.get('messages', [])
         except HttpError as e:
             if e.resp.status == 403:
                 error_detail = "Insufficient OAuth permissions (gmail.readonly scope required)"
             else:
                 error_detail = f"Gmail API HTTP {e.resp.status}: {e.reason}"
+            pending_updates = {}
             for rec in submitted_records:
                 if rec.get('status') == 'SUBMITTED':
                     rec['status'] = 'UNKNOWN'
                     rec['remark'] = f"Bounce check failed ({error_detail}); delivery unconfirmed"
                     rec['error'] = "None"
-                    if logger:
-                        logger.update_email_record(
-                            recipient=rec['recipient'],
-                            new_status='UNKNOWN',
-                            remark=rec['remark'],
-                            error=rec['error'],
-                            bounce_time='N/A',
-                            message_id=rec.get('message_id'),
-                            subject=rec.get('subject')
-                        )
+                    pending_updates[rec['recipient']] = {
+                        'new_status': 'UNKNOWN',
+                        'error': "None",
+                        'remark': rec['remark'],
+                        'bounce_time': 'N/A',
+                        'message_id': rec.get('message_id'),
+                        'subject': rec.get('subject')
+                    }
+            if logger and pending_updates:
+                logger.batch_update_email_records(pending_updates)
             return submitted_records
         except Exception as e:
             error_detail = str(e)
+            pending_updates = {}
             for rec in submitted_records:
                 if rec.get('status') == 'SUBMITTED':
                     rec['status'] = 'UNKNOWN'
                     rec['remark'] = f"Bounce check unavailable ({error_detail}); delivery unconfirmed"
                     rec['error'] = "None"
-                    if logger:
-                        logger.update_email_record(
-                            recipient=rec['recipient'],
-                            new_status='UNKNOWN',
-                            remark=rec['remark'],
-                            error=rec['error'],
-                            bounce_time='N/A',
-                            message_id=rec.get('message_id'),
-                            subject=rec.get('subject')
-                        )
+                    pending_updates[rec['recipient']] = {
+                        'new_status': 'UNKNOWN',
+                        'error': "None",
+                        'remark': rec['remark'],
+                        'bounce_time': 'N/A',
+                        'message_id': rec.get('message_id'),
+                        'subject': rec.get('subject')
+                    }
+            if logger and pending_updates:
+                logger.batch_update_email_records(pending_updates)
             return submitted_records
 
-        # Retrieve and parse bounce notifications
+        # Concurrently retrieve and parse bounce notifications
         bounces = []
-        for msg_meta in messages:
-            msg_id = msg_meta.get('id')
-            try:
-                msg_full = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
-                parsed = parse_bounce_notification(msg_full)
-                if parsed:
-                    bounces.append(parsed)
-            except Exception:
-                pass
+        if messages:
+            def fetch_single_bounce(msg_meta):
+                msg_id = msg_meta.get('id')
+                try:
+                    thread_svc = get_thread_safe_service(service)
+                    msg_full = execute_with_retry(
+                        lambda: thread_svc.users().messages().get(userId='me', id=msg_id, format='full').execute()
+                    )
+                    return parse_bounce_notification(msg_full)
+                except Exception:
+                    return None
+
+            max_fetch_workers = min(cfg.num_workers, len(messages))
+            if max_fetch_workers > 1:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max_fetch_workers) as executor:
+                    parsed_results = list(executor.map(fetch_single_bounce, messages))
+                bounces = [p for p in parsed_results if p is not None]
+            else:
+                for msg_meta in messages:
+                    res = fetch_single_bounce(msg_meta)
+                    if res:
+                        bounces.append(res)
 
         if cached_bounces is not None:
             cached_bounces.extend(bounces)
 
     bounce_time = datetime.now().strftime('%H:%M:%S')
+    pending_updates = {}
 
     # Match bounces against submitted records
     for rec in submitted_records:
@@ -597,18 +1214,16 @@ def detect_bounces(
         if matched_bounce:
             rec['status'] = 'BOUNCED'
             rec['bounce_time'] = bounce_time
-            rec['error'] = matched_bounce['error_code'] if matched_bounce['error_code'] != "None" else matched_bounce['reason']
             rec['remark'] = matched_bounce['reason']
-            if logger:
-                logger.update_email_record(
-                    recipient=rec['recipient'],
-                    new_status='BOUNCED',
-                    remark=rec['remark'],
-                    error=rec['error'],
-                    bounce_time=rec['bounce_time'],
-                    message_id=rec.get('message_id'),
-                    subject=rec.get('subject')
-                )
+            rec['error'] = matched_bounce['error_code'] if matched_bounce['error_code'] != "None" else matched_bounce['reason']
+            pending_updates[rec['recipient']] = {
+                'new_status': 'BOUNCED',
+                'error': rec['error'],
+                'remark': rec['remark'],
+                'bounce_time': rec['bounce_time'],
+                'message_id': rec.get('message_id'),
+                'subject': rec.get('subject')
+            }
         else:
             # If no bounce found, ensure status is UNKNOWN (delivery remains unconfirmed)
             if rec['status'] == 'SUBMITTED':
@@ -616,175 +1231,389 @@ def detect_bounces(
                 rec['remark'] = "No bounce detected; delivery unconfirmed"
                 rec['error'] = "None"
                 rec['bounce_time'] = "N/A"
-                if logger:
-                    logger.update_email_record(
-                        recipient=rec['recipient'],
-                        new_status='UNKNOWN',
-                        remark=rec['remark'],
-                        error=rec['error'],
-                        bounce_time=rec['bounce_time'],
-                        message_id=rec.get('message_id'),
-                        subject=rec.get('subject')
-                    )
+                pending_updates[rec['recipient']] = {
+                    'new_status': 'UNKNOWN',
+                    'error': "None",
+                    'remark': rec['remark'],
+                    'bounce_time': "N/A",
+                    'message_id': rec.get('message_id'),
+                    'subject': rec.get('subject')
+                }
+
+    # Batch update log file in a single file pass
+    if logger and pending_updates:
+        logger.batch_update_email_records(pending_updates)
 
     return submitted_records
 
 
-def main():
-    logger = OutreachLogger()
+def process_recipients_concurrently(
+    recipients: List[str],
+    service,
+    subject: str,
+    html_template: str,
+    resume_path: str,
+    logger: Optional[OutreachLogger] = None,
+    directory: Optional[RecruiterDirectory] = None,
+    dashboard: Optional[LiveDashboard] = None,
+    num_workers: Optional[int] = None,
+    api_call_delay: Optional[float] = None,
+    config: Optional[Config] = None
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Process recipients across concurrent workers independently.
+    Handles deduplication within run, validation, MIME creation, thread-safe sending,
+    Excel directory registration for SUBMITTED emails, live dashboard state updates,
+    and DRY_RUN mode.
+    Returns (all_records, submitted_records).
+    """
+    cfg = config or get_config()
+    workers_count = num_workers if num_workers is not None else cfg.num_workers
+    delay = api_call_delay if api_call_delay is not None else cfg.gmail_api_request_delay
+    retries = cfg.max_retries
+    retry_delay = cfg.retry_backoff_seconds
+    is_dry_run = cfg.dry_run
+    from_email = cfg.sender_email
+    logging_active = cfg.logging_enabled and logger is not None
+    excel_active = cfg.excel_directory_enabled and directory is not None
 
-    print("=== Recruiter Outreach Agent ===\n")
+    all_records: List[Dict[str, Any]] = []
+    submitted_records: List[Dict[str, Any]] = []
+
+    seen_lock = threading.Lock()
+    seen_in_run: Set[str] = set()
+
+    api_lock = threading.Lock()
+    log_lock = threading.Lock()
+    records_lock = threading.Lock()
+
+    worker_slots: queue.Queue = queue.Queue()
+    for i in range(1, workers_count + 1):
+        worker_slots.put(i)
+
+    resume_data = get_cached_resume(resume_path)
+
+    def worker_task(recipient_raw: str) -> Optional[Dict[str, Any]]:
+        slot = worker_slots.get()
+        norm_email = recipient_raw.strip()
+        lower_email = norm_email.lower()
+
+        try:
+            # 1. State: VALIDATING
+            if dashboard:
+                dashboard.update_worker(slot, state='VALIDATING', recipient=norm_email)
+
+            # In-run duplicate check
+            with seen_lock:
+                if lower_email in seen_in_run:
+                    is_duplicate = True
+                else:
+                    seen_in_run.add(lower_email)
+                    is_duplicate = False
+
+            if is_duplicate:
+                if dashboard:
+                    dashboard.increment_counter('SKIPPED')
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+                return None
+
+            # Email format validation
+            if not is_valid_email(norm_email):
+                now = datetime.now()
+                rec = {
+                    'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+                    'recipient': norm_email,
+                    'status': 'INVALID',
+                    'subject': subject,
+                    'message_id': 'N/A',
+                    'submitted_time': 'N/A',
+                    'bounce_time': 'N/A',
+                    'error': 'None'
+                }
+                if logging_active:
+                    with log_lock:
+                        logger.log_email_record(rec)
+                with records_lock:
+                    all_records.append(rec)
+                if dashboard:
+                    dashboard.increment_counter('INVALID')
+                    dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+                return rec
+
+            # 2. State: SENDING
+            if dashboard:
+                dashboard.update_worker(slot, state='SENDING', recipient=norm_email)
+
+            now = datetime.now()
+            rec = {
+                'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+                'recipient': norm_email,
+                'subject': subject,
+                'status': None,
+                'message_id': 'N/A',
+                'submitted_time': now.strftime('%H:%M:%S'),
+                'bounce_time': 'N/A',
+                'error': 'None'
+            }
+
+            if is_dry_run:
+                # DRY RUN: simulate submission safely without sending real email
+                if delay > 0:
+                    time.sleep(delay)
+                msg_id = f"dry_run_{abs(hash(norm_email)) % 1000000:06d}"
+                rec['message_id'] = msg_id
+                rec['status'] = 'SUBMITTED'
+
+                if excel_active:
+                    directory.add_email(norm_email)
+
+                if logging_active:
+                    with log_lock:
+                        logger.log_email_record(rec)
+
+                with records_lock:
+                    all_records.append(rec)
+                    submitted_records.append(rec)
+
+                if dashboard:
+                    dashboard.increment_counter('SUBMITTED')
+                    dashboard.update_worker(slot, state='SUBMITTED', recipient=norm_email)
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+
+                return rec
+
+            try:
+                message_body = create_message(
+                    to_email=norm_email,
+                    subject=subject,
+                    html_content=html_template,
+                    resume_path=resume_path,
+                    resume_data=resume_data,
+                    from_email=from_email
+                )
+
+                thread_svc = get_thread_safe_service(service)
+
+                def api_call():
+                    with api_lock:
+                        if delay > 0:
+                            time.sleep(delay)
+                    return thread_svc.users().messages().send(userId='me', body=message_body).execute()
+
+                resp = execute_with_retry(api_call, max_retries=retries, initial_delay=retry_delay)
+                msg_id = resp.get('id', 'N/A')
+                rec['message_id'] = msg_id
+                rec['status'] = 'SUBMITTED'
+
+                # Add to public Excel directory if enabled
+                if excel_active:
+                    directory.add_email(norm_email)
+
+                if logging_active:
+                    with log_lock:
+                        logger.log_email_record(rec)
+
+                with records_lock:
+                    all_records.append(rec)
+                    submitted_records.append(rec)
+
+                if dashboard:
+                    dashboard.increment_counter('SUBMITTED')
+                    dashboard.update_worker(slot, state='SUBMITTED', recipient=norm_email)
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+
+                return rec
+
+            except HttpError as error:
+                err_text = f"HTTP {error.resp.status}: {error.reason}"
+                rec['status'] = 'FAILED_TO_SUBMIT'
+                rec['submitted_time'] = 'N/A'
+                rec['error'] = err_text
+
+                if logging_active:
+                    with log_lock:
+                        logger.log_email_record(rec)
+                with records_lock:
+                    all_records.append(rec)
+
+                if dashboard:
+                    dashboard.increment_counter('FAILED_TO_SUBMIT')
+                    dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+
+                return rec
+
+            except Exception as error:
+                rec['status'] = 'FAILED_TO_SUBMIT'
+                rec['submitted_time'] = 'N/A'
+                rec['error'] = str(error)
+
+                if logging_active:
+                    with log_lock:
+                        logger.log_email_record(rec)
+                with records_lock:
+                    all_records.append(rec)
+
+                if dashboard:
+                    dashboard.increment_counter('FAILED_TO_SUBMIT')
+                    dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
+                    dashboard.record_completed()
+                    dashboard.update_worker(slot, state='IDLE', recipient='-')
+
+                return rec
+
+        finally:
+            worker_slots.put(slot)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers_count) as executor:
+        futures = [executor.submit(worker_task, r) for r in recipients]
+        for f in concurrent.futures.as_completed(futures):
+            f.result()
+
+    return all_records, submitted_records
+
+
+def main():
+    config = get_config()
+    try:
+        config.validate()
+    except Exception as e:
+        print(f"Configuration Error: {e}")
+        return
+
+    logger = OutreachLogger(config.log_file) if config.logging_enabled else None
+    directory = RecruiterDirectory(config.excel_directory_file) if config.excel_directory_enabled else None
 
     # 1. Check prerequisite files & parse template
-    if not os.path.exists(DEFAULT_RESUME):
-        err_msg = f"Resume attachment '{DEFAULT_RESUME}' not found."
-        print(f"Error: {err_msg}")
+    if not os.path.exists(config.resume_file):
+        print(f"Error: Resume attachment '{config.resume_file}' not found.")
+        return
+
+    if not os.path.exists(config.email_template_file):
+        print(f"Error: Email template '{config.email_template_file}' not found.")
         return
 
     try:
-        subject, html_template = parse_template(DEFAULT_TEMPLATE)
+        extracted_subject, html_template = parse_template(config.email_template_file)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
         return
 
-    # 2. Read and validate emails from CSV
+    # Subject priority: .env EMAIL_SUBJECT > HTML template comment
+    subject = config.email_subject.strip() if config.email_subject and config.email_subject.strip() else extracted_subject
+
+    # 2. Read raw recruiter emails from CSV
     try:
-        valid_emails, invalid_emails = read_recruiter_emails(DEFAULT_CSV)
+        raw_recipients = read_raw_recruiter_emails(config.recruiter_csv_file)
     except FileNotFoundError as e:
         print(f"Error: {e}")
         return
 
-    total_recipients = len(invalid_emails) + len(valid_emails)
+    total_recipients = len(raw_recipients)
     if total_recipients == 0:
         print("No email addresses found in CSV.")
         return
 
-    # 3. Authenticate with Gmail API
+    # 3. Authenticate with Gmail API (skip if dry_run)
     service = None
-    try:
-        service = get_gmail_service()
-    except Exception as e:
-        print(f"Authentication failed: {e}")
-        return
-
-    curr_index = 1
-    all_records: List[Dict[str, Any]] = []
-    submitted_records: List[Dict[str, Any]] = []
-
-    # Process invalid emails
-    for inv in invalid_emails:
-        print(f"[{curr_index}/{total_recipients}] {inv} - INVALID")
-        curr_index += 1
-        now = datetime.now()
-        rec = {
-            'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-            'recipient': inv,
-            'status': 'INVALID',
-            'subject': subject,
-            'message_id': 'N/A',
-            'submitted_time': 'N/A',
-            'bounce_time': 'N/A',
-            'remark': 'Invalid email format; skipped',
-            'error': 'None'
-        }
-        all_records.append(rec)
-        logger.log_email_record(rec)
-
-    # Submit valid emails
-    for recipient in valid_emails:
-        now = datetime.now()
-        rec = {
-            'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
-            'recipient': recipient,
-            'subject': subject,
-            'status': None,
-            'message_id': 'N/A',
-            'submitted_time': now.strftime('%H:%M:%S'),
-            'bounce_time': 'N/A',
-            'remark': 'None',
-            'error': 'None'
-        }
+    if not config.dry_run:
         try:
-            message_body = create_message(
-                to_email=recipient,
-                subject=subject,
-                html_content=html_template,
-                resume_path=DEFAULT_RESUME
+            service = get_gmail_service(
+                credentials_file=config.gmail_credentials_file,
+                token_file=config.gmail_token_file
             )
-            resp = service.users().messages().send(userId='me', body=message_body).execute()
-            msg_id = resp.get('id', 'N/A')
-            rec['message_id'] = msg_id
-            rec['status'] = 'SUBMITTED'
-            rec['remark'] = 'Gmail API accepted email; delivery unconfirmed'
-            rec['error'] = 'None'
-            submitted_records.append(rec)
-            all_records.append(rec)
-            logger.log_email_record(rec)
-            print(f"[{curr_index}/{total_recipients}] {recipient} - SUBMITTED")
-        except HttpError as error:
-            err_text = f"HTTP {error.resp.status}: {error.reason}"
-            rec['status'] = 'FAILED_TO_SUBMIT'
-            rec['submitted_time'] = 'N/A'
-            rec['remark'] = 'Gmail API rejected sending request'
-            rec['error'] = err_text
-            all_records.append(rec)
-            logger.log_email_record(rec)
-            print(f"[{curr_index}/{total_recipients}] {recipient} - FAILED_TO_SUBMIT")
-        except Exception as error:
-            err_text = str(error)
-            rec['status'] = 'FAILED_TO_SUBMIT'
-            rec['submitted_time'] = 'N/A'
-            rec['remark'] = 'Sending failed'
-            rec['error'] = err_text
-            all_records.append(rec)
-            logger.log_email_record(rec)
-            print(f"[{curr_index}/{total_recipients}] {recipient} - FAILED_TO_SUBMIT")
-        curr_index += 1
+        except Exception as e:
+            print(f"Authentication failed: {e}")
+            return
+    else:
+        print("Note: Running in DRY_RUN mode. Real emails will not be sent.")
 
-    # 4. Check for Bounces (Current run + Delayed bounces from previous unconfirmed emails)
-    if service:
+    # 4. Initialize dashboard if enabled
+    dashboard = None
+    if config.dashboard_enabled:
+        dashboard = LiveDashboard(
+            total_recipients=total_recipients,
+            num_workers=config.num_workers,
+            refresh_rate=config.dashboard_refresh_rate
+        )
+
+    # 5. Process recipients concurrently
+    all_records, submitted_records = process_recipients_concurrently(
+        recipients=raw_recipients,
+        service=service,
+        subject=subject,
+        html_template=html_template,
+        resume_path=config.resume_file,
+        logger=logger,
+        directory=directory,
+        dashboard=dashboard,
+        config=config
+    )
+
+    # 6. Check for Bounces (Current run + Delayed bounces from previous unconfirmed emails)
+    if config.bounce_check_enabled and service and not config.dry_run:
         cached_bounces: List[Dict[str, Any]] = []
-        # Check current batch
         if submitted_records:
             detect_bounces(
                 service,
                 submitted_records,
                 logger=logger,
-                delay_seconds=BOUNCE_CHECK_DELAY_SECONDS,
-                cached_bounces=cached_bounces
+                delay_seconds=config.bounce_check_delay_seconds,
+                cached_bounces=cached_bounces,
+                config=config
             )
 
-        # Check previously unconfirmed emails from logs (delayed bounces)
-        try:
-            prev_unconfirmed = logger.get_unconfirmed_records()
-            curr_emails = {r['recipient'].lower() for r in submitted_records}
-            prev_to_check = [r for r in prev_unconfirmed if r['recipient'].lower() not in curr_emails]
-            if prev_to_check:
-                detect_bounces(
-                    service,
-                    prev_to_check,
-                    logger=logger,
-                    delay_seconds=0,
-                    cached_bounces=cached_bounces if cached_bounces else None
-                )
-        except Exception:
-            pass
+        if logger:
+            try:
+                prev_unconfirmed = logger.get_unconfirmed_records()
+                curr_emails = {r['recipient'].lower() for r in submitted_records}
+                prev_to_check = [r for r in prev_unconfirmed if r['recipient'].lower() not in curr_emails]
+                if prev_to_check:
+                    detect_bounces(
+                        service,
+                        prev_to_check,
+                        logger=logger,
+                        delay_seconds=0,
+                        cached_bounces=cached_bounces if cached_bounces else None,
+                        config=config
+                    )
+            except Exception:
+                pass
 
-    # 5. Calculate Summary Counts
-    submitted_count = len(submitted_records)
-    bounced_count = sum(1 for r in submitted_records if r.get('status') == 'BOUNCED')
-    failed_count = sum(1 for r in all_records if r.get('status') == 'FAILED_TO_SUBMIT')
-    invalid_count = len(invalid_emails)
-    unknown_count = sum(1 for r in submitted_records if r.get('status') == 'UNKNOWN')
-
-    # 6. Display Minimal Terminal Output
-    print("\nSummary:")
-    print(f"Submitted: {submitted_count}")
-    print(f"Bounced: {bounced_count}")
-    print(f"Failed: {failed_count}")
-    print(f"Invalid: {invalid_count}")
-    print(f"Unknown: {unknown_count}\n")
-    print(f"Logs: {LOG_FILE}")
+    # 7. Final Summary
+    if dashboard:
+        bounced_count = sum(1 for r in submitted_records if r.get('status') == 'BOUNCED')
+        unknown_count = sum(1 for r in submitted_records if r.get('status') == 'UNKNOWN')
+        dashboard.set_counter('BOUNCED', bounced_count)
+        dashboard.set_counter('UNKNOWN', unknown_count)
+        dashboard.render_final_summary(
+            log_path=config.log_file if config.logging_enabled else "Disabled",
+            excel_path=config.excel_directory_file if config.excel_directory_enabled else "Disabled"
+        )
+    else:
+        submitted_count = len(submitted_records)
+        bounced_count = sum(1 for r in submitted_records if r.get('status') == 'BOUNCED')
+        failed_count = sum(1 for r in all_records if r.get('status') == 'FAILED_TO_SUBMIT')
+        invalid_count = sum(1 for r in all_records if r.get('status') == 'INVALID')
+        unknown_count = sum(1 for r in submitted_records if r.get('status') == 'UNKNOWN')
+        skipped_count = total_recipients - len(all_records)
+        print("\n=== Execution Summary ===")
+        print(f"Total Recipients:     {total_recipients}")
+        print(f"Submitted:            {submitted_count}")
+        print(f"Bounced:              {bounced_count}")
+        print(f"Unknown (Pending):    {unknown_count}")
+        print(f"Failed to Submit:     {failed_count}")
+        print(f"Invalid Format:       {invalid_count}")
+        print(f"Skipped (Duplicates): {skipped_count}")
+        if config.logging_enabled:
+            print(f"Logs:                 {config.log_file}")
+        if config.excel_directory_enabled:
+            print(f"Public Directory:     {config.excel_directory_file}")
 
 
 if __name__ == '__main__':

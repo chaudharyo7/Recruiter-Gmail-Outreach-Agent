@@ -22,7 +22,7 @@ Recruiter Gmail Outreach Agent/
 │   └── token.json              # Auto-generated OAuth access token (git-ignored)
 │
 ├── data/
-│   └── recruiters.csv          # Recruiter email list (pre-populated with dummy sample rows)
+│   └── recruiter_contacts.csv  # Recruiter email list (pre-populated with dummy sample rows)
 │
 ├── templates/
 │   └── template.html           # Predefined HTML email template with contact placeholders
@@ -44,7 +44,7 @@ Recruiter Gmail Outreach Agent/
 
 ## Features
 
-- **CSV Ingestion**: Reads recipient emails from `data/recruiters.csv`.
+- **CSV Ingestion**: Reads recipient emails from `data/recruiter_contacts.csv`.
 - **Validation**: Verifies email address format using regex and skips invalid addresses.
 - **Gmail API with OAuth 2.0**: Secure authentication using `config/credentials.json` without storing raw passwords.
 - **HTML Email Template**: Sends formatted emails using `templates/template.html`.
@@ -94,7 +94,7 @@ pip install -r requirements.txt
    *(See `config/README.md` and `config/credentials.json.example` for details).*
 
 ### 5. Prepare Recruiter CSV
-Open `data/recruiters.csv` and replace the dummy example emails with your target recruiter addresses:
+Open `data/recruiter_contacts.csv` and replace the dummy example emails with your target recruiter addresses:
 ```csv
 email
 recruiter1@company.com
@@ -108,26 +108,52 @@ attachments/resume.pdf
 ```
 *(If you prefer a custom filename, place it in `attachments/` and set `RESUME_FILE` in `.env`).*
 
-### 7. Customize Email Template
-`templates/template.html` is the single source of truth for both your email subject and email body:
+### 7. Centralized Configuration (`.env`)
+
+All configurable settings are managed centrally through a single `.env` file. Copy `.env.example` to `.env`:
+```bash
+cp .env.example .env
+```
+
+| Section | Setting | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **Email** | `SENDER_EMAIL` | *(empty)* | Optional sender email address to include in the `From` header. |
+| | `EMAIL_SUBJECT` | *(empty)* | Custom email subject. If left empty, extracts subject from the HTML template comment (`<!-- Subject: ... -->`). |
+| | `EMAIL_TEMPLATE_FILE`| `templates/template.html` | Path to HTML email template. |
+| | `RESUME_FILE` | `attachments/resume.pdf` | Path to your resume PDF attachment. |
+| | `RECRUITER_CSV_FILE` | `data/recruiter_contacts.csv` | Path to input CSV containing recruiter emails. |
+| **Workers** | `NUM_WORKERS` | `3` | Number of parallel worker threads in `ThreadPoolExecutor`. |
+| | `MAX_RETRIES` | `3` | Max retries with exponential backoff on transient Gmail API errors (429, 500, 502, 503, 504). |
+| | `RETRY_BACKOFF_SECONDS`| `2` | Initial retry backoff delay in seconds for transient API errors. |
+| | `GMAIL_API_REQUEST_DELAY`| `0` | Delay in seconds between API requests per worker to pace rate limits. |
+| **Excel Directory**| `EXCEL_DIRECTORY_ENABLED`| `true` | When `true`, automatically registers all successfully `SUBMITTED` emails into the public directory. |
+| | `EXCEL_DIRECTORY_FILE`| `data/recruiter_email_backup.xlsx` | Path to the reusable public recruiter Excel directory. |
+| **Bounce Detection**| `BOUNCE_CHECK_ENABLED` | `true` | When `true`, scans inbox for bounce notifications and updates log records. |
+| | `BOUNCE_CHECK_DELAY_SECONDS`| `5` | Delay in seconds before checking for immediate bounces. |
+| **Logging** | `LOGGING_ENABLED` | `true` | When `true`, writes persistent one-line status records to `outreach.log`. |
+| | `LOG_FILE` | `logs/outreach.log` | Path to persistent outreach log file. |
+| **Dashboard** | `DASHBOARD_ENABLED` | `true` | When `true`, displays a real-time live terminal dashboard with worker states and progress. |
+| | `DASHBOARD_REFRESH_RATE`| `4` | Dashboard refresh rate in Hz (screen renders per second). |
+| **OAuth** | `GMAIL_CREDENTIALS_FILE`| `credentials.json` | Path to Google OAuth client credentials JSON (falls back to `config/credentials.json`). |
+| | `GMAIL_TOKEN_FILE` | `token.json` | Path to saved OAuth token JSON (falls back to `config/token.json`). |
+| **Execution** | `DRY_RUN` | `false` | When `true`, simulates end-to-end execution, worker states, and dashboard progress **without sending real emails**. |
+
+### 8. Customize Email Template
+`templates/template.html` manages your email body and default subject:
 - Define your email subject in the HTML comment at the very top:
   ```html
   <!-- Subject: Application for DevOps / Cloud Engineer Opportunities -->
   ```
 - Edit the HTML body and update signature placeholders with your contact info and links.
-Changing the subject comment automatically changes the subject of outgoing emails without modifying any code.
+Changing the subject comment automatically changes the subject of outgoing emails without modifying any code (unless overridden by `EMAIL_SUBJECT` in `.env`).
 
-### 8. Run Verification Tests (Optional)
-Run the unit test suite to verify configuration, CSV parsing, email generation, and PDF attachment without sending emails:
-```bash
-python tests/test_agent.py
-```
-or
+### 9. Run Verification Tests (Optional)
+Run the unit test suite to verify configuration loading, CSV parsing, 3-worker concurrency, Excel directory, and DRY_RUN mode without sending emails:
 ```bash
 python -m unittest discover tests
 ```
 
-### 9. Run the Agent
+### 10. Run the Agent
 Execute the outreach script:
 ```bash
 python main.py
