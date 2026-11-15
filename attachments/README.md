@@ -22,3 +22,4 @@ Place your resume PDF file in this directory.
      ```
 
 > **Security Note:** All `*.pdf` files in this directory are excluded by `.gitignore` to ensure personal resumes are never committed to version control.
+

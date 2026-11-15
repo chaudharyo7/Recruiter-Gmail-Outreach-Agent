@@ -19,7 +19,7 @@ This directory holds the OAuth 2.0 Client credentials required to authenticate w
    - Navigate to **APIs & Services > OAuth consent screen**.
    - Choose **External** for User Type and click **Create**.
    - Enter an App Name (e.g., `Recruiter Outreach Agent`) and your email for support and developer contacts.
-   - Under **Scopes**, click **Add or Remove Scopes**, search for `https://www.googleapis.com/auth/gmail.send`, select it, and click **Update**.
+   - Under **Scopes**, click **Add or Remove Scopes**, add `https://www.googleapis.com/auth/gmail.send` and `https://www.googleapis.com/auth/gmail.readonly`, and click **Update**.
    - Under **Test Users**, add the personal Gmail address you will use to send emails.
    - Click **Save and Continue** to finish.
 
@@ -38,3 +38,4 @@ This directory holds the OAuth 2.0 Client credentials required to authenticate w
      ```
 
 > **Security Note:** Both `credentials.json` and the auto-generated `token.json` are listed in `.gitignore` and will never be committed to version control. Refer to `credentials.json.example` for the expected JSON structure.
+
