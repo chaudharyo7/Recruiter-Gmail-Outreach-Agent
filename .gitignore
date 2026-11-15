@@ -1,0 +1,41 @@
+# Google OAuth Credentials & Tokens
+config/*.json
+!config/.gitkeep
+credentials.json
+token.json
+
+# Environment variables
+.env
+.env.*
+.env.local
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & compiled artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Personal resumes and attachments (PDFs)
+attachments/*.pdf
+*.pdf
+!attachments/.gitkeep
+
+# Actual recruiter email lists containing private addresses
+data/recruiters.csv
+data/*actual*.csv
+data/*private*.csv
+!data/recruiters_sample.csv
+!data/.gitkeep
+
+# Mac OS & Editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
