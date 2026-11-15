@@ -27,18 +27,20 @@ from main import (
 class TestRecruiterOutreachAgent(unittest.TestCase):
 
     def test_01_resume_pdf_validity(self):
-        """Verify that resume.pdf exists, is non-empty, and has a valid PDF header."""
-        self.assertTrue(os.path.exists(DEFAULT_RESUME), "resume.pdf must exist")
+        """Verify that resume PDF exists, is non-empty, and has a valid PDF header."""
+        if not os.path.exists(DEFAULT_RESUME):
+            self.skipTest(f"Resume not found at '{DEFAULT_RESUME}'. Place your PDF resume in attachments/ to run this test.")
         size = os.path.getsize(DEFAULT_RESUME)
-        self.assertGreater(size, 1000, "resume.pdf should be a real PDF file (>1KB)")
+        self.assertGreater(size, 1000, "resume PDF should be a valid PDF file (>1KB)")
         with open(DEFAULT_RESUME, 'rb') as f:
             header = f.read(5)
-            self.assertEqual(header, b'%PDF-', "resume.pdf must start with '%PDF-' header")
+            self.assertEqual(header, b'%PDF-', "resume file must start with '%PDF-' header")
         print(f"\n[PASS] Resume file validated: '{DEFAULT_RESUME}' ({size} bytes, valid PDF)")
 
     def test_02_credentials_exist(self):
         """Verify that credentials.json is present and has desktop client config."""
-        self.assertTrue(os.path.exists(CREDENTIALS_FILE), f"{CREDENTIALS_FILE} must be present")
+        if not os.path.exists(CREDENTIALS_FILE):
+            self.skipTest(f"Credentials not found at '{CREDENTIALS_FILE}'. Follow config/README.md to add credentials.json.")
         import json
         with open(CREDENTIALS_FILE, 'r') as f:
             creds = json.load(f)
@@ -95,6 +97,8 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
 
     def test_05_email_generation_and_attachment(self):
         """Verify email generation, HTML body, and PDF attachment without sending."""
+        if not os.path.exists(DEFAULT_RESUME):
+            self.skipTest(f"Resume not found at '{DEFAULT_RESUME}'. Place your PDF resume in attachments/ to run this test.")
         self.assertTrue(os.path.exists(DEFAULT_TEMPLATE), "template.html must exist")
         with open(DEFAULT_TEMPLATE, 'r', encoding='utf-8') as f:
             html_content = f.read()

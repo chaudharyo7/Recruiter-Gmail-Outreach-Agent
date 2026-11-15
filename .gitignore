@@ -1,6 +1,6 @@
 # Google OAuth Credentials & Tokens
 config/*.json
-!config/.gitkeep
+!config/credentials.json.example
 credentials.json
 token.json
 
@@ -25,14 +25,11 @@ __pycache__/
 # Personal resumes and attachments (PDFs)
 attachments/*.pdf
 *.pdf
-!attachments/.gitkeep
 
-# Actual recruiter email lists containing private addresses
-data/recruiters.csv
+# Private recruiter lists
 data/*actual*.csv
 data/*private*.csv
-!data/recruiters_sample.csv
-!data/.gitkeep
+data/*local*.csv
 
 # Mac OS & Editor artifacts
 .DS_Store

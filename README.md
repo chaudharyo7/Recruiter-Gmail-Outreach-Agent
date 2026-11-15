@@ -1,6 +1,6 @@
 # Recruiter Gmail Outreach Agent
 
-A lightweight, automated Python agent to send individualized outreach emails with resume attachments to recruiters using Gmail API OAuth 2.0.
+A lightweight, automated Python agent to send individualized outreach emails with resume attachments to recruiters using the Gmail API with OAuth 2.0.
 
 ---
 
@@ -12,37 +12,36 @@ Recruiter Gmail Outreach Agent/
 ├── main.py                     # Main execution script
 ├── requirements.txt            # Python package dependencies
 ├── README.md                   # Setup and execution guide
-├── .gitignore                  # Ignores credentials, tokens, .env, .venv, PDFs, private CSVs
+├── .gitignore                  # Ignores credentials, tokens, .env, .venv, and PDFs
 ├── .env.example                # Sample environment configuration
 │
 ├── config/
-│   ├── .gitkeep
-│   ├── credentials.json        # OAuth 2.0 Client credentials (git-ignored)
-│   └── token.json              # Generated user access/refresh token (git-ignored)
+│   ├── README.md               # Detailed OAuth credential setup instructions
+│   ├── credentials.json.example# Sample client credentials structure
+│   ├── credentials.json        # Your actual OAuth client credentials (git-ignored)
+│   └── token.json              # Auto-generated OAuth access token (git-ignored)
 │
 ├── data/
-│   ├── .gitkeep
-│   ├── recruiters_sample.csv   # Sample template CSV with dummy addresses
-│   └── recruiters.csv          # Your target recruiter email list (git-ignored)
+│   └── recruiters.csv          # Recruiter email list (pre-populated with dummy sample rows)
 │
 ├── templates/
-│   └── template.html           # Predefined HTML email template
+│   └── template.html           # Predefined HTML email template with contact placeholders
 │
 ├── attachments/
-│   ├── .gitkeep
-│   └── resume.pdf              # Your resume attached to each email (git-ignored)
+│   ├── README.md               # Instructions for attaching your resume
+│   └── resume.pdf              # Your resume PDF to attach (git-ignored)
 │
 ├── tests/
 │   └── test_agent.py           # Non-destructive test suite
 │
-└── .venv/                      # Python virtual environment
+└── .venv/                      # Python virtual environment (git-ignored)
 ```
 
 ---
 
 ## Features
 
-- **CSV Ingestion**: Reads recipient emails from `data/recruiters.csv` (or `data/recruiters_sample.csv`).
+- **CSV Ingestion**: Reads recipient emails from `data/recruiters.csv`.
 - **Validation**: Verifies email address format using regex and skips invalid addresses.
 - **Gmail API with OAuth 2.0**: Secure authentication using `config/credentials.json` without storing raw passwords.
 - **HTML Email Template**: Sends formatted emails using `templates/template.html`.
@@ -53,52 +52,61 @@ Recruiter Gmail Outreach Agent/
 
 ---
 
-## 1. Setup & Installation
+## Quickstart Guide
 
-1. **Virtual Environment**:
-   ```bash
-   python3 -m venv .venv
-   source .venv/bin/activate
-   ```
+Follow these steps to configure and run the outreach agent:
 
-2. **Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+### 1. Clone Repository
+```bash
+git clone https://github.com/chaudharyo7/Recruiter-Gmail-Outreach-Agent.git
+cd Recruiter-Gmail-Outreach-Agent
+```
 
----
+### 2. Create Virtual Environment
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-## 2. Configuration & Preparation
+### 3. Install Requirements
+```bash
+pip install -r requirements.txt
+```
 
-1. **OAuth Credentials**:
-   Download your OAuth 2.0 Desktop Client JSON from Google Cloud Console and place it at:
+### 4. Configure Gmail API and OAuth Credentials
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/) and create a project.
+2. Enable the **Gmail API** in **APIs & Services > Library**.
+3. In **OAuth consent screen**:
+   - Set User Type to **External**.
+   - Add scope: `https://www.googleapis.com/auth/gmail.send`.
+   - Add your Gmail address under **Test Users**.
+4. In **Credentials**, create an **OAuth Client ID** for **Desktop App**.
+5. Download the JSON, rename it to `credentials.json`, and place it in the `config/` directory:
    ```text
    config/credentials.json
    ```
+   *(See `config/README.md` and `config/credentials.json.example` for details).*
 
-2. **Recruiter List**:
-   Add your target recruiter emails to `data/recruiters.csv`:
-   ```csv
-   email
-   recruiter1@company.com
-   recruiter2@company.com
-   ```
+### 5. Prepare Recruiter CSV
+Open `data/recruiters.csv` and replace the dummy example emails with your target recruiter addresses:
+```csv
+email
+recruiter1@company.com
+recruiter2@company.com
+```
 
-3. **Resume**:
-   Place your PDF resume into the `attachments/` directory (e.g. `attachments/resume.pdf` or set `RESUME_FILE` in `.env`).
+### 6. Add Personal Resume
+Copy your PDF resume into the `attachments/` directory and name it `resume.pdf`:
+```text
+attachments/resume.pdf
+```
+*(If you prefer a custom filename, place it in `attachments/` and set `RESUME_FILE` in `.env`).*
 
-4. **Email Template**:
-   Customize the email body text and signature placeholders in:
-   ```text
-   templates/template.html
-   ```
+### 7. Customize Email Template
+Edit `templates/template.html` to adjust the body text and update the signature placeholders with your name and links.
 
----
-
-## 3. Testing (Without Sending Emails)
-
-Run the unit test suite to verify PDF validity, credentials format, regex validation, CSV parsing, and MIME email construction with attachment:
-
+### 8. Run Verification Tests (Optional)
+Run the unit test suite to verify configuration, CSV parsing, email generation, and PDF attachment without sending emails:
 ```bash
 python tests/test_agent.py
 ```
@@ -107,20 +115,12 @@ or
 python -m unittest discover tests
 ```
 
----
-
-## 4. Execution
-
-To start the agent and send emails, run from the project root:
-
+### 9. Run the Agent
+Execute the outreach script:
 ```bash
 python main.py
 ```
 
-### What to Expect on First Run:
-1. The script will open a browser window asking you to log into your Google Account.
-2. Select your account and grant permission to send emails.
-   *(If prompted with "Google hasn't verified this app", click **Advanced > Go to Recruiter Outreach Agent (unsafe)** — this is standard for personal test apps).*
-3. Once approved, the script automatically saves `config/token.json` so you will not need to re-authenticate on future runs.
-4. The agent processes each recruiter email sequentially, validates its format, attaches the resume, sends the email individually, and prints progress.
-5. A summary report is displayed in the terminal upon completion.
+- On first run, a browser tab will open asking you to authorize your Google Account with the `gmail.send` scope.
+- Once authorized, `config/token.json` is generated automatically for future runs.
+- The agent will send each email individually and print a summary report with sent, failed, and skipped counts.

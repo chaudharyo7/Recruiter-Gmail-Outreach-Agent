@@ -28,12 +28,7 @@ except ImportError:
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/gmail.send']
-DEFAULT_CSV = os.getenv(
-    'CSV_FILE',
-    os.path.join('data', 'recruiters.csv')
-    if os.path.exists(os.path.join('data', 'recruiters.csv'))
-    else os.path.join('data', 'recruiters_sample.csv')
-)
+DEFAULT_CSV = os.getenv('CSV_FILE', os.path.join('data', 'recruiters.csv'))
 DEFAULT_TEMPLATE = os.getenv('TEMPLATE_FILE', os.path.join('templates', 'template.html'))
 DEFAULT_RESUME = os.getenv(
     'RESUME_FILE',
