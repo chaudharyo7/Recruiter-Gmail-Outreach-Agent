@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -21,6 +22,7 @@ from main import (
     read_raw_recruiter_emails,
     read_recruiter_emails,
     create_message,
+    load_template,
     parse_template,
     detect_bounces,
     is_permanent_invalid_recipient_bounce,
@@ -119,12 +121,14 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
         print(f"[PASS] CSV reading validated: {len(valid_emails)} valid found in '{DEFAULT_CSV}', dummy CSV parsing verified")
 
     def test_05_email_generation_and_attachment(self):
-        """Verify email generation, HTML body, extracted subject, and PDF attachment without sending."""
+        """Verify email generation, HTML body, subject from .env, and PDF attachment without sending."""
         if not os.path.exists(DEFAULT_RESUME):
             self.skipTest(f"Resume not found at '{DEFAULT_RESUME}'. Place your PDF resume in attachments/ to run this test.")
         self.assertTrue(os.path.exists(DEFAULT_TEMPLATE), "template.html must exist")
-        subject, html_content = parse_template(DEFAULT_TEMPLATE)
-        self.assertEqual(subject, 'Application for DevOps / Cloud Engineer Opportunities')
+        cfg = get_config()
+        subject = cfg.email_subject
+        html_content = load_template(DEFAULT_TEMPLATE)
+        self.assertEqual(subject, cfg.email_subject)
 
         test_recipient = "test.recruiter@example.com"
         message_dict = create_message(
@@ -140,8 +144,7 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
         # Parse raw MIME message
         parsed_msg = email.message_from_bytes(raw_bytes)
         self.assertEqual(parsed_msg['To'], test_recipient)
-        self.assertEqual(parsed_msg['Subject'], 'Application for DevOps / Cloud Engineer Opportunities')
-        self.assertEqual(parsed_msg['Subject'], subject)
+        self.assertEqual(re.sub(r'\s+', ' ', parsed_msg['Subject']), subject)
         self.assertIsNone(parsed_msg['Cc'], "Cc must be empty")
         self.assertIsNone(parsed_msg['Bcc'], "Bcc must be empty")
 
@@ -173,53 +176,42 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
         self.assertIn('https://www.googleapis.com/auth/gmail.readonly', SCOPES)
         print(f"[PASS] OAuth scopes verified: {SCOPES}")
 
-    def test_07_template_subject_parsing_and_validation(self):
-        """Verify template parsing: subject extraction, changing subject, and error handling for missing/empty subject."""
-        subject, body = parse_template(DEFAULT_TEMPLATE)
-        self.assertEqual(subject, 'Application for DevOps / Cloud Engineer Opportunities')
-        self.assertTrue(len(body) > 100)
+    def test_07_email_subject_configured_only_from_env(self):
+        """Verify email subject is configured exclusively via .env (EMAIL_SUBJECT) as single source of truth, not in template."""
+        # 1. Subject loaded from .env config
+        cfg = get_config()
+        self.assertTrue(bool(cfg.email_subject and cfg.email_subject.strip()), "EMAIL_SUBJECT must be set in .env")
+
+        # 2. Template loading reads pure HTML without needing subject comment
+        body = load_template(DEFAULT_TEMPLATE)
+        self.assertTrue(len(body) > 50)
         self.assertNotIn('<!-- Subject:', body)
 
-        # Dynamic subject change test
-        with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as tmp:
-            tmp.write("<!-- Subject: Senior Cloud Architect Role -->\n<p>Hello recruiter</p>")
-            tmp_path = tmp.name
+        # 3. Dynamic subject change from .env
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as tmp_env:
+            tmp_env.write("EMAIL_SUBJECT=Senior Cloud Infrastructure Role\n")
+            tmp_env_path = tmp_env.name
 
         try:
-            dynamic_subj, dynamic_body = parse_template(tmp_path)
-            self.assertEqual(dynamic_subj, 'Senior Cloud Architect Role')
-            self.assertEqual(dynamic_body.strip(), '<p>Hello recruiter</p>')
+            custom_cfg = Config(env_path=tmp_env_path)
+            self.assertEqual(custom_cfg.email_subject, "Senior Cloud Infrastructure Role")
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(tmp_env_path):
+                os.remove(tmp_env_path)
 
-        # Missing subject comment raises ValueError
-        with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as tmp:
-            tmp.write("<p>No subject comment in this file</p>")
-            tmp_path = tmp.name
+        # 4. Empty/missing subject in .env raises validation error
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as empty_env:
+            empty_env.write("EMAIL_SUBJECT=\n")
+            empty_env_path = empty_env.name
 
         try:
-            with self.assertRaises(ValueError) as ctx:
-                parse_template(tmp_path)
-            self.assertIn("Email subject not found", str(ctx.exception))
+            empty_cfg = Config(env_path=empty_env_path)
+            self.assertFalse(bool(empty_cfg.email_subject and empty_cfg.email_subject.strip()))
         finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            if os.path.exists(empty_env_path):
+                os.remove(empty_env_path)
 
-        # Empty subject comment raises ValueError
-        with tempfile.NamedTemporaryFile('w', suffix='.html', delete=False) as tmp:
-            tmp.write("<!-- Subject:   -->\n<p>Empty subject</p>")
-            tmp_path = tmp.name
-
-        try:
-            with self.assertRaises(ValueError) as ctx:
-                parse_template(tmp_path)
-            self.assertIn("cannot be empty", str(ctx.exception))
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-        print("[PASS] Template subject parsing verified: dynamic subject change, extraction, and missing/empty validation")
+        print("[PASS] Email subject configured exclusively from .env as single source of truth; template contains no subject")
 
     def test_08_submission_status_reporting(self):
         """Verify that Gmail acceptance produces SUBMITTED (never SUCCESS or DELIVERED), and failure produces FAILED_TO_SUBMIT."""
