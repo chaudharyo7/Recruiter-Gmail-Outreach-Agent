@@ -287,7 +287,8 @@ class OutreachLogger:
             ts = record.get('timestamp') or datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             sub_time = record.get('submitted_time')
             if not sub_time or sub_time == "None":
-                if record.get('status') in ('SUBMITTED', 'UNKNOWN'):
+                st = record.get('status')
+                if st in ('SENT', 'SUBMITTED', 'UNKNOWN') or (st and str(st).startswith('UNDELIVERED')):
                     sub_time = ts.split(' ')[1] if ' ' in ts else ts
                 else:
                     sub_time = "N/A"
@@ -387,14 +388,20 @@ class OutreachLogger:
                                 orig_sub_time = re.sub(r'^Submitted:\s*', '', p).strip()
                                 break
                         new_status = upd.get('new_status', parts[2])
-                        if orig_sub_time == "N/A" and ('SUBMITTED' in parts[2] or new_status in ('SUBMITTED', 'UNKNOWN', 'BOUNCED')):
+                        is_sub = (
+                            'SENT' in parts[2]
+                            or 'SUBMITTED' in parts[2]
+                            or new_status in ('SENT', 'SUBMITTED', 'BOUNCED')
+                            or str(new_status).startswith('UNDELIVERED')
+                        )
+                        if orig_sub_time == "N/A" and is_sub:
                             orig_sub_time = orig_timestamp.split(' ')[1] if ' ' in orig_timestamp else orig_timestamp
 
                         # Determine bounce_time
                         cur_bounce = "N/A"
                         if upd.get('bounce_time'):
                             cur_bounce = upd['bounce_time']
-                        elif new_status == 'BOUNCED':
+                        elif str(new_status).startswith('UNDELIVERED') or new_status == 'BOUNCED':
                             cur_bounce = now_time
                         else:
                             for p in parts[3:]:
@@ -432,7 +439,7 @@ class OutreachLogger:
             return updated_count
 
     def get_unconfirmed_records(self) -> List[Dict[str, Any]]:
-        """Retrieve previously logged records with SUBMITTED or UNKNOWN status for delayed bounce checks."""
+        """Retrieve previously logged records with SENT status (and legacy SUBMITTED/UNKNOWN) for delayed bounce checks."""
         if not os.path.exists(self.log_path):
             return []
 
@@ -449,7 +456,13 @@ class OutreachLogger:
                                 bounce_str = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
                                 break
 
-                        if status in ('SUBMITTED', 'UNKNOWN') and bounce_str == 'N/A':
+                        is_active_sent = (
+                            status in ('SENT', 'SUBMITTED', 'UNKNOWN')
+                            and not status.startswith('UNDELIVERED')
+                            and status != 'BOUNCED'
+                            and bounce_str == 'N/A'
+                        )
+                        if is_active_sent:
                             mid = "N/A"
                             subj = "N/A"
                             sub_time = "N/A"
@@ -469,7 +482,7 @@ class OutreachLogger:
                                 'message_id': mid,
                                 'submitted_time': sub_time,
                                 'bounce_time': 'N/A',
-                                'remark': 'No bounce detected; delivery unconfirmed',
+                                'remark': 'Sent; awaiting delayed bounce check',
                                 'error': 'None'
                             })
         return unconfirmed
@@ -558,6 +571,57 @@ class RecruiterDirectory:
                 if wb:
                     wb.close()
 
+    def remove_email(self, email_str: str) -> bool:
+        """Remove an email from the Excel directory if present (case-insensitive).
+        Thread-safe. Returns True if removed, False otherwise.
+        """
+        return self.remove_emails([email_str]) > 0
+
+    def remove_emails(self, email_list: List[str]) -> int:
+        """Remove a collection of emails from the Excel directory (case-insensitive).
+        Thread-safe. Preserves single 'Email' column and all other valid addresses.
+        Returns count of removed emails.
+        """
+        if openpyxl is None or not os.path.exists(self.excel_path):
+            return 0
+        to_remove = {e.strip().lower() for e in email_list if e and isinstance(e, str) and e.strip()}
+        if not to_remove:
+            return 0
+
+        with self._lock:
+            matching = to_remove.intersection(self._emails_lower)
+            if not matching:
+                return 0
+
+            wb = None
+            try:
+                wb = openpyxl.load_workbook(self.excel_path)
+                ws = wb.active
+                remaining = []
+                for row in ws.iter_rows(min_row=2, max_col=1, values_only=True):
+                    val = row[0]
+                    if val and isinstance(val, str) and val.strip():
+                        if val.strip().lower() not in matching:
+                            remaining.append(val.strip())
+
+                new_ws = wb.create_sheet(title="_temp_recruiters", index=0)
+                new_ws.cell(row=1, column=1, value="Email")
+                for idx, email_val in enumerate(remaining, start=2):
+                    new_ws.cell(row=idx, column=1, value=email_val)
+
+                for sheet_name in list(wb.sheetnames):
+                    if sheet_name != "_temp_recruiters":
+                        wb.remove(wb[sheet_name])
+                new_ws.title = "Recruiters"
+                wb.save(self.excel_path)
+                self._emails_lower.difference_update(matching)
+                return len(matching)
+            except Exception:
+                return 0
+            finally:
+                if wb:
+                    wb.close()
+
     def get_all_emails(self) -> List[str]:
         """Return all emails currently stored in the directory."""
         if openpyxl is None or not os.path.exists(self.excel_path):
@@ -606,15 +670,13 @@ class LiveDashboard:
             for i in range(1, self.num_workers + 1)
         }
 
-        # Counters
+        # Counters: exactly TWO user-facing delivery statuses
         self.counters: Dict[str, int] = {
-            'SUBMITTED': 0,
-            'INVALID': 0,
-            'FAILED_TO_SUBMIT': 0,
-            'BOUNCED': 0,
-            'UNKNOWN': 0,
-            'SKIPPED': 0
+            'SENT': 0,
+            'UNDELIVERED': 0
         }
+        self.undelivered_recipients: List[Dict[str, Any]] = []
+        self.execution_errors: List[Dict[str, Any]] = []
 
     def update_worker(self, worker_id: int, state: str, recipient: str) -> None:
         with self._lock:
@@ -627,13 +689,26 @@ class LiveDashboard:
         with self._lock:
             if counter_name in self.counters:
                 self.counters[counter_name] += delta
+            else:
+                self.counters[counter_name] = delta
             self._render_locked()
 
     def set_counter(self, counter_name: str, value: int) -> None:
         with self._lock:
-            if counter_name in self.counters:
-                self.counters[counter_name] = value
+            self.counters[counter_name] = value
             self._render_locked()
+
+    def set_undelivered_recipients(self, records: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.undelivered_recipients = list(records)
+
+    def add_execution_error(self, recipient: str, error_msg: str) -> None:
+        with self._lock:
+            self.execution_errors.append({'recipient': recipient, 'error': error_msg})
+
+    def set_execution_errors(self, errors: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.execution_errors = list(errors)
 
     def record_completed(self) -> None:
         with self._lock:
@@ -670,7 +745,7 @@ class LiveDashboard:
 
         lines.extend([
             "------------------------------------ Counters -----------------------------------",
-            f" SUBMITTED: {self.counters['SUBMITTED']} | INVALID: {self.counters['INVALID']} | FAILED_TO_SUBMIT: {self.counters['FAILED_TO_SUBMIT']} | BOUNCED: {self.counters['BOUNCED']} | UNKNOWN: {self.counters['UNKNOWN']} | SKIPPED: {self.counters['SKIPPED']}",
+            f" SENT: {self.counters.get('SENT', 0)} | UNDELIVERED: {self.counters.get('UNDELIVERED', 0)}",
             "================================================================================="
         ])
 
@@ -681,7 +756,13 @@ class LiveDashboard:
         sys.stdout.flush()
         self.lines_rendered = len(lines)
 
-    def render_final_summary(self, log_path: str = LOG_FILE, excel_path: str = DEFAULT_EXCEL_DIRECTORY) -> None:
+    def render_final_summary(
+        self,
+        log_path: str = LOG_FILE,
+        excel_path: str = DEFAULT_EXCEL_DIRECTORY,
+        undelivered_recipients: Optional[List[Dict[str, Any]]] = None,
+        execution_errors: Optional[List[Dict[str, Any]]] = None
+    ) -> None:
         with self._lock:
             self._render_locked(force=True)
             elapsed = max(0.001, time.time() - self.start_time)
@@ -689,6 +770,9 @@ class LiveDashboard:
             pct = (self.completed / self.total_recipients * 100.0) if self.total_recipients > 0 else 100.0
             mins, secs = divmod(int(elapsed), 60)
             elapsed_str = f"{mins:02d}:{secs:02d}"
+
+            sent_cnt = self.counters.get('SENT', 0)
+            undelivered_cnt = self.counters.get('UNDELIVERED', 0)
 
             summary = [
                 "",
@@ -700,18 +784,32 @@ class LiveDashboard:
                 f"Processing Rate:      {rate:.1f} emails/min",
                 "",
                 "--- Status Counters ---",
-                f"SUBMITTED:            {self.counters['SUBMITTED']}",
-                f"BOUNCED:              {self.counters['BOUNCED']}",
-                f"UNKNOWN:              {self.counters['UNKNOWN']}",
-                f"FAILED_TO_SUBMIT:     {self.counters['FAILED_TO_SUBMIT']}",
-                f"INVALID:              {self.counters['INVALID']}",
-                f"SKIPPED:              {self.counters['SKIPPED']}",
+                f"SENT:                 {sent_cnt}",
+                f"UNDELIVERED:          {undelivered_cnt}"
+            ]
+
+            undelivered = undelivered_recipients if undelivered_recipients is not None else self.undelivered_recipients
+            if undelivered:
+                summary.append("")
+                summary.append("--- Undelivered Recipients ---")
+                for u in undelivered:
+                    summary.append(f"Recipient: {u['recipient']}")
+                    summary.append(f"Status: {u['status']}")
+
+            errs = execution_errors if execution_errors is not None else self.execution_errors
+            if errs:
+                summary.append("")
+                summary.append("--- Execution Error Details ---")
+                for e in errs:
+                    summary.append(f"  - {e['recipient']}: {e.get('error', 'Error')}")
+
+            summary.extend([
                 "",
                 f"Logs:                 {log_path}",
                 f"Public Directory:     {excel_path}",
                 "===============================================================================",
                 ""
-            ]
+            ])
             print("\n".join(summary))
 
 
@@ -1093,10 +1191,77 @@ def execute_with_retry(
         raise last_err
 
 
+TEMPORARY_BOUNCE_PATTERNS = [
+    r'\bmailbox\s+full\b',
+    r'\bover\s+quota\b',
+    r'\bquota\s+exceeded\b',
+    r'\bstorage\s+quota\b',
+    r'\bexceeded\s+storage\b',
+    r'\btemporar(?:y|ily)\b',
+    r'\b(?:delivery|message|mail)?\s*temporar(?:y|ily)\s+delayed?\b',
+    r'\b(?:delivery|message|mail)\s+delayed?\b',
+    r'\bdelayed?\s+(?:delivery|mail|message)\b',
+    r'\bgreylist(?:ed|ing)?\b',
+    r'\btry\s+again\b',
+    r'\bretry\s+later\b',
+    r'\brate\s+limit\b',
+    r'\btoo\s+many\s+connections\b',
+    r'\bserver\s+busy\b',
+    r'\b4\.\d\.\d\b',
+    r'\b45[0-2]\b',
+    r'\b552\b',
+    r'\b5\.2\.2\b'
+]
+
+PERMANENT_INVALID_RECIPIENT_PATTERNS = [
+    r'\bdoes\s+not\s+exist\b',
+    r'\baddress\s+(?:couldn\'?t\s+be\s+found|could\s+not\s+be\s+found|not\s+found)\b',
+    r'\binvalid\s+recipient\b',
+    r'\brecipient\s+invalid\b',
+    r'\brecipient\s+(?:not\s+found|rejected|unknown)\b',
+    r'\buser\s+(?:unknown|not\s+found|does\s+not\s+exist)\b',
+    r'\bno\s+such\s+(?:mailbox|user|recipient|address|person)\b',
+    r'\bmailbox\s+(?:does\s+not\s+exist|not\s+found|unavailable)\b',
+    r'\baccount\s+(?:does\s+not\s+exist|disabled|not\s+found)\b',
+    r'\b5\.1\.1\b',
+    r'\b5\.1\.2\b',
+    r'\b550[- ]5\.1\.1\b',
+]
+
+
+def is_permanent_invalid_recipient_bounce(bounce_info: Any) -> bool:
+    """Determine whether a bounce notification indicates a confirmed permanent invalid recipient
+    (e.g., mailbox does not exist, address not found, user unknown, no such mailbox).
+    Returns False for temporary failures (e.g. mailbox full, server errors, greylisting, delayed).
+    """
+    if isinstance(bounce_info, dict):
+        text_to_check = " ".join([
+            str(bounce_info.get('reason', '')),
+            str(bounce_info.get('snippet', '')),
+            str(bounce_info.get('full_text_lower', '')),
+            str(bounce_info.get('error_code', ''))
+        ]).lower()
+    else:
+        text_to_check = str(bounce_info).lower()
+
+    # 1. Check for temporary failure indicators first
+    for pat in TEMPORARY_BOUNCE_PATTERNS:
+        if re.search(pat, text_to_check):
+            return False
+
+    # 2. Check for permanent invalid recipient indicators
+    for pat in PERMANENT_INVALID_RECIPIENT_PATTERNS:
+        if re.search(pat, text_to_check):
+            return True
+
+    return False
+
+
 def detect_bounces(
     service,
     submitted_records: List[Dict[str, Any]],
     logger: Optional[OutreachLogger] = None,
+    directory: Optional[RecruiterDirectory] = None,
     delay_seconds: int = 0,
     cached_bounces: Optional[List[Dict[str, Any]]] = None,
     config: Optional[Config] = None
@@ -1105,7 +1270,8 @@ def detect_bounces(
     Check Gmail inbox for delivery failure notifications from mailer-daemon,
     mail delivery subsystem, or postmaster.
     Uses concurrent message retrieval and batch logging for high performance.
-    Matches notifications to submitted records, updates status to BOUNCED or UNKNOWN,
+    Matches notifications to submitted records, updates status to UNDELIVERED (reason),
+    removes confirmed permanent invalid recipients from the Excel directory,
     and updates outreach.log in-place without duplicate records.
     """
     if not submitted_records:
@@ -1126,46 +1292,8 @@ def detect_bounces(
                 lambda: svc.users().messages().list(userId='me', q=query, maxResults=50).execute()
             )
             messages = resp.get('messages', [])
-        except HttpError as e:
-            if e.resp.status == 403:
-                error_detail = "Insufficient OAuth permissions (gmail.readonly scope required)"
-            else:
-                error_detail = f"Gmail API HTTP {e.resp.status}: {e.reason}"
-            pending_updates = {}
-            for rec in submitted_records:
-                if rec.get('status') == 'SUBMITTED':
-                    rec['status'] = 'UNKNOWN'
-                    rec['remark'] = f"Bounce check failed ({error_detail}); delivery unconfirmed"
-                    rec['error'] = "None"
-                    pending_updates[rec['recipient']] = {
-                        'new_status': 'UNKNOWN',
-                        'error': "None",
-                        'remark': rec['remark'],
-                        'bounce_time': 'N/A',
-                        'message_id': rec.get('message_id'),
-                        'subject': rec.get('subject')
-                    }
-            if logger and pending_updates:
-                logger.batch_update_email_records(pending_updates)
-            return submitted_records
-        except Exception as e:
-            error_detail = str(e)
-            pending_updates = {}
-            for rec in submitted_records:
-                if rec.get('status') == 'SUBMITTED':
-                    rec['status'] = 'UNKNOWN'
-                    rec['remark'] = f"Bounce check unavailable ({error_detail}); delivery unconfirmed"
-                    rec['error'] = "None"
-                    pending_updates[rec['recipient']] = {
-                        'new_status': 'UNKNOWN',
-                        'error': "None",
-                        'remark': rec['remark'],
-                        'bounce_time': 'N/A',
-                        'message_id': rec.get('message_id'),
-                        'subject': rec.get('subject')
-                    }
-            if logger and pending_updates:
-                logger.batch_update_email_records(pending_updates)
+        except Exception:
+            # Never downgrade or mark UNDELIVERED on bounce-check errors or missing permissions
             return submitted_records
 
         # Concurrently retrieve and parse bounce notifications
@@ -1198,6 +1326,7 @@ def detect_bounces(
 
     bounce_time = datetime.now().strftime('%H:%M:%S')
     pending_updates = {}
+    permanent_removals = []
 
     # Match bounces against submitted records
     for rec in submitted_records:
@@ -1212,37 +1341,34 @@ def detect_bounces(
                 break
 
         if matched_bounce:
-            rec['status'] = 'BOUNCED'
+            reason = matched_bounce['reason'].strip()
+            new_status = reason if reason.startswith('UNDELIVERED') else f"UNDELIVERED ({reason})"
+            rec['status'] = new_status
             rec['bounce_time'] = bounce_time
-            rec['remark'] = matched_bounce['reason']
-            rec['error'] = matched_bounce['error_code'] if matched_bounce['error_code'] != "None" else matched_bounce['reason']
+            rec['remark'] = reason
+            rec['error'] = matched_bounce['error_code'] if matched_bounce['error_code'] != "None" else reason
             pending_updates[rec['recipient']] = {
-                'new_status': 'BOUNCED',
+                'new_status': new_status,
                 'error': rec['error'],
                 'remark': rec['remark'],
                 'bounce_time': rec['bounce_time'],
                 'message_id': rec.get('message_id'),
                 'subject': rec.get('subject')
             }
+            if directory and is_permanent_invalid_recipient_bounce(matched_bounce):
+                permanent_removals.append(rec['recipient'])
         else:
-            # If no bounce found, ensure status is UNKNOWN (delivery remains unconfirmed)
-            if rec['status'] == 'SUBMITTED':
-                rec['status'] = 'UNKNOWN'
-                rec['remark'] = "No bounce detected; delivery unconfirmed"
-                rec['error'] = "None"
-                rec['bounce_time'] = "N/A"
-                pending_updates[rec['recipient']] = {
-                    'new_status': 'UNKNOWN',
-                    'error': "None",
-                    'remark': rec['remark'],
-                    'bounce_time': "N/A",
-                    'message_id': rec.get('message_id'),
-                    'subject': rec.get('subject')
-                }
+            # Unmatched records remain SENT (never changed to UNKNOWN)
+            if rec.get('status') in ('SUBMITTED', None):
+                rec['status'] = 'SENT'
 
     # Batch update log file in a single file pass
     if logger and pending_updates:
         logger.batch_update_email_records(pending_updates)
+
+    # Remove permanent invalid recipient addresses from Excel directory
+    if directory and permanent_removals:
+        directory.remove_emails(permanent_removals)
 
     return submitted_records
 
@@ -1328,7 +1454,7 @@ def process_recipients_concurrently(
                     'message_id': 'N/A',
                     'submitted_time': 'N/A',
                     'bounce_time': 'N/A',
-                    'error': 'None'
+                    'error': 'Invalid email address format; skipped'
                 }
                 if logging_active:
                     with log_lock:
@@ -1336,7 +1462,7 @@ def process_recipients_concurrently(
                 with records_lock:
                     all_records.append(rec)
                 if dashboard:
-                    dashboard.increment_counter('INVALID')
+                    dashboard.add_execution_error(norm_email, 'Invalid email address format; skipped')
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
                     dashboard.update_worker(slot, state='IDLE', recipient='-')
@@ -1364,7 +1490,7 @@ def process_recipients_concurrently(
                     time.sleep(delay)
                 msg_id = f"dry_run_{abs(hash(norm_email)) % 1000000:06d}"
                 rec['message_id'] = msg_id
-                rec['status'] = 'SUBMITTED'
+                rec['status'] = 'SENT'
 
                 if excel_active:
                     directory.add_email(norm_email)
@@ -1378,8 +1504,8 @@ def process_recipients_concurrently(
                     submitted_records.append(rec)
 
                 if dashboard:
-                    dashboard.increment_counter('SUBMITTED')
-                    dashboard.update_worker(slot, state='SUBMITTED', recipient=norm_email)
+                    dashboard.increment_counter('SENT')
+                    dashboard.update_worker(slot, state='SENT', recipient=norm_email)
                     dashboard.record_completed()
                     dashboard.update_worker(slot, state='IDLE', recipient='-')
 
@@ -1406,7 +1532,7 @@ def process_recipients_concurrently(
                 resp = execute_with_retry(api_call, max_retries=retries, initial_delay=retry_delay)
                 msg_id = resp.get('id', 'N/A')
                 rec['message_id'] = msg_id
-                rec['status'] = 'SUBMITTED'
+                rec['status'] = 'SENT'
 
                 # Add to public Excel directory if enabled
                 if excel_active:
@@ -1421,8 +1547,8 @@ def process_recipients_concurrently(
                     submitted_records.append(rec)
 
                 if dashboard:
-                    dashboard.increment_counter('SUBMITTED')
-                    dashboard.update_worker(slot, state='SUBMITTED', recipient=norm_email)
+                    dashboard.increment_counter('SENT')
+                    dashboard.update_worker(slot, state='SENT', recipient=norm_email)
                     dashboard.record_completed()
                     dashboard.update_worker(slot, state='IDLE', recipient='-')
 
@@ -1441,7 +1567,7 @@ def process_recipients_concurrently(
                     all_records.append(rec)
 
                 if dashboard:
-                    dashboard.increment_counter('FAILED_TO_SUBMIT')
+                    dashboard.add_execution_error(norm_email, err_text)
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
                     dashboard.update_worker(slot, state='IDLE', recipient='-')
@@ -1460,7 +1586,7 @@ def process_recipients_concurrently(
                     all_records.append(rec)
 
                 if dashboard:
-                    dashboard.increment_counter('FAILED_TO_SUBMIT')
+                    dashboard.add_execution_error(norm_email, str(error))
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
                     dashboard.update_worker(slot, state='IDLE', recipient='-')
@@ -1563,6 +1689,7 @@ def main():
                 service,
                 submitted_records,
                 logger=logger,
+                directory=directory,
                 delay_seconds=config.bounce_check_delay_seconds,
                 cached_bounces=cached_bounces,
                 config=config
@@ -1578,6 +1705,7 @@ def main():
                         service,
                         prev_to_check,
                         logger=logger,
+                        directory=directory,
                         delay_seconds=0,
                         cached_bounces=cached_bounces if cached_bounces else None,
                         config=config
@@ -1586,32 +1714,42 @@ def main():
                 pass
 
     # 7. Final Summary
+    undelivered_records = [
+        r for r in submitted_records
+        if str(r.get('status', '')).startswith('UNDELIVERED') or r.get('status') == 'BOUNCED'
+    ]
+    sent_count = max(0, len(submitted_records) - len(undelivered_records))
+    undelivered_count = len(undelivered_records)
+    execution_errors = [
+        r for r in all_records
+        if r.get('status') in ('FAILED_TO_SUBMIT', 'INVALID')
+    ]
+
     if dashboard:
-        bounced_count = sum(1 for r in submitted_records if r.get('status') == 'BOUNCED')
-        unknown_count = sum(1 for r in submitted_records if r.get('status') == 'UNKNOWN')
-        dashboard.set_counter('BOUNCED', bounced_count)
-        dashboard.set_counter('UNKNOWN', unknown_count)
+        dashboard.set_counter('SENT', sent_count)
+        dashboard.set_counter('UNDELIVERED', undelivered_count)
+        dashboard.set_undelivered_recipients(undelivered_records)
+        dashboard.set_execution_errors(execution_errors)
         dashboard.render_final_summary(
             log_path=config.log_file if config.logging_enabled else "Disabled",
             excel_path=config.excel_directory_file if config.excel_directory_enabled else "Disabled"
         )
     else:
-        submitted_count = len(submitted_records)
-        bounced_count = sum(1 for r in submitted_records if r.get('status') == 'BOUNCED')
-        failed_count = sum(1 for r in all_records if r.get('status') == 'FAILED_TO_SUBMIT')
-        invalid_count = sum(1 for r in all_records if r.get('status') == 'INVALID')
-        unknown_count = sum(1 for r in submitted_records if r.get('status') == 'UNKNOWN')
-        skipped_count = total_recipients - len(all_records)
         print("\n=== Execution Summary ===")
         print(f"Total Recipients:     {total_recipients}")
-        print(f"Submitted:            {submitted_count}")
-        print(f"Bounced:              {bounced_count}")
-        print(f"Unknown (Pending):    {unknown_count}")
-        print(f"Failed to Submit:     {failed_count}")
-        print(f"Invalid Format:       {invalid_count}")
-        print(f"Skipped (Duplicates): {skipped_count}")
+        print(f"SENT:                 {sent_count}")
+        print(f"UNDELIVERED:          {undelivered_count}")
+        if undelivered_records:
+            print("\n--- Undelivered Recipients ---")
+            for ur in undelivered_records:
+                print(f"Recipient: {ur['recipient']}")
+                print(f"Status: {ur['status']}")
+        if execution_errors:
+            print("\n--- Execution Error Details ---")
+            for ee in execution_errors:
+                print(f"  - {ee['recipient']}: {ee.get('error', 'Error')}")
         if config.logging_enabled:
-            print(f"Logs:                 {config.log_file}")
+            print(f"\nLogs:                 {config.log_file}")
         if config.excel_directory_enabled:
             print(f"Public Directory:     {config.excel_directory_file}")
 
