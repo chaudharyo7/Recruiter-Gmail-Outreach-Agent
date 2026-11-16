@@ -813,11 +813,9 @@ class LiveDashboard:
             print("\n".join(summary))
 
 
-def parse_template(template_path: str) -> Tuple[str, str]:
-    """
-    Read HTML template file, extract the email subject from the HTML comment,
-    and return (subject, html_body).
-    Raises ValueError if subject is missing or empty.
+def load_template(template_path: str) -> str:
+    """Read HTML template file and return HTML content.
+    Email subject is configured exclusively via .env (EMAIL_SUBJECT), not in the template.
     """
     if not os.path.exists(template_path):
         raise FileNotFoundError(f"Email template not found: {template_path}")
@@ -825,21 +823,18 @@ def parse_template(template_path: str) -> Tuple[str, str]:
     with open(template_path, 'r', encoding='utf-8') as f:
         content = f.read()
 
-    match = SUBJECT_REGEX.search(content)
-    if not match:
-        raise ValueError(
-            f"Email subject not found in '{template_path}'. "
-            "Please define it using: <!-- Subject: Your Subject Here -->"
-        )
+    # Strip legacy subject comment if present so it doesn't appear in the HTML body
+    cleaned = SUBJECT_REGEX.sub('', content).lstrip()
+    return cleaned
 
-    subject = match.group(1).strip()
-    if not subject:
-        raise ValueError(
-            f"Email subject in '{template_path}' cannot be empty. "
-            "Please provide a valid subject: <!-- Subject: Your Subject Here -->"
-        )
 
-    html_body = (content[:match.start()] + content[match.end():]).lstrip()
+def parse_template(template_path: str) -> Tuple[str, str]:
+    """Compatibility helper: reads HTML template file and returns (subject, html_body).
+    Email subject is retrieved from .env EMAIL_SUBJECT as the single source of truth.
+    """
+    html_body = load_template(template_path)
+    cfg = get_config()
+    subject = (cfg.email_subject or '').strip()
     return subject, html_body
 
 
@@ -1624,14 +1619,16 @@ def main():
         print(f"Error: Email template '{config.email_template_file}' not found.")
         return
 
-    try:
-        extracted_subject, html_template = parse_template(config.email_template_file)
-    except (FileNotFoundError, ValueError) as e:
-        print(f"Error: {e}")
+    subject = (config.email_subject or '').strip()
+    if not subject:
+        print("Error: EMAIL_SUBJECT must be set in .env. Email subject is configured exclusively via .env.")
         return
 
-    # Subject priority: .env EMAIL_SUBJECT > HTML template comment
-    subject = config.email_subject.strip() if config.email_subject and config.email_subject.strip() else extracted_subject
+    try:
+        html_template = load_template(config.email_template_file)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return
 
     # 2. Read raw recruiter emails from CSV
     try:
