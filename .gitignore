@@ -26,10 +26,11 @@ __pycache__/
 attachments/*.pdf
 *.pdf
 
-# Private recruiter lists
-data/*actual*.csv
-data/*private*.csv
-data/*local*.csv
+# Email templates (personal signatures & contact details)
+templates/
+
+# Recruiter contacts and email backup directory
+data/
 
 # Logs
 logs/*.log
