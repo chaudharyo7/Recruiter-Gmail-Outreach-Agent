@@ -8,7 +8,7 @@ import queue
 import base64
 import threading
 import concurrent.futures
-from datetime import datetime
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -133,6 +133,17 @@ class Config:
         self.excel_directory_enabled: bool = parse_bool(get_val('EXCEL_DIRECTORY_ENABLED'), default=True)
         self.excel_directory_file: str = get_val('EXCEL_DIRECTORY_FILE') or os.path.join('data', 'recruiter_email_backup.xlsx')
 
+        # DUPLICATE PREVENTION
+        self.duplicate_check_enabled: bool = parse_bool(get_val('DUPLICATE_CHECK_ENABLED'), default=True)
+        raw_cooldown = get_val('DUPLICATE_COOLDOWN_DAYS')
+        if raw_cooldown is not None and str(raw_cooldown).strip() != '':
+            try:
+                self.duplicate_cooldown_days: int = int(str(raw_cooldown).strip())
+            except (ValueError, TypeError):
+                self.duplicate_cooldown_days = 0
+        else:
+            self.duplicate_cooldown_days = 10
+
         # BOUNCE DETECTION
         self.bounce_check_enabled: bool = parse_bool(get_val('BOUNCE_CHECK_ENABLED'), default=True)
         self.bounce_check_delay_seconds: int = parse_int(get_val('BOUNCE_CHECK_DELAY_SECONDS'), default=5, min_val=0)
@@ -190,6 +201,8 @@ class Config:
             raise ValueError(f"DASHBOARD_REFRESH_RATE must be > 0, got {self.dashboard_refresh_rate}")
         if self.bounce_check_delay_seconds < 0:
             raise ValueError(f"BOUNCE_CHECK_DELAY_SECONDS must be >= 0, got {self.bounce_check_delay_seconds}")
+        if self.duplicate_cooldown_days < 1:
+            raise ValueError(f"DUPLICATE_COOLDOWN_DAYS must be a positive integer >= 1, got {self.duplicate_cooldown_days}")
 
 
 _CONFIG = Config()
@@ -218,6 +231,8 @@ LOG_FILE = _CONFIG.log_file
 BOUNCE_CHECK_DELAY_SECONDS = _CONFIG.bounce_check_delay_seconds
 DEFAULT_EXCEL_DIRECTORY = _CONFIG.excel_directory_file
 NUM_WORKERS = _CONFIG.num_workers
+DUPLICATE_CHECK_ENABLED = _CONFIG.duplicate_check_enabled
+DUPLICATE_COOLDOWN_DAYS = _CONFIG.duplicate_cooldown_days
 
 EMAIL_REGEX = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
 SUBJECT_REGEX = re.compile(r'<!--\s*Subject:\s*(.+?)\s*-->', re.IGNORECASE)
@@ -308,6 +323,11 @@ class OutreachLogger:
         with self._lock:
             with open(self.log_path, 'a', encoding='utf-8') as f:
                 f.writelines(lines)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
 
     def update_email_record(
         self,
@@ -435,6 +455,11 @@ class OutreachLogger:
             if updated_count > 0:
                 with open(self.log_path, 'w', encoding='utf-8') as f:
                     f.writelines(lines)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except OSError:
+                        pass
 
             return updated_count
 
@@ -486,6 +511,290 @@ class OutreachLogger:
                                 'error': 'None'
                             })
         return unconfirmed
+
+
+def parse_log_timestamp(ts_str: str) -> Optional[datetime]:
+    """Parse timestamp string from outreach.log into datetime object."""
+    if not ts_str:
+        return None
+    cleaned = ts_str.strip()
+    for fmt in ('%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d'):
+        try:
+            return datetime.strptime(cleaned, fmt)
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        return None
+
+
+def parse_log_line(line: str) -> Optional[Dict[str, Any]]:
+    """Parse a single physical outreach.log line into structured fields."""
+    parts = [p.strip() for p in line.split('|')]
+    if len(parts) < 3:
+        return None
+
+    orig_timestamp = parts[0]
+    recipient = parts[1]
+    status = parts[2]
+
+    subject = "N/A"
+    message_id = "N/A"
+    submitted_time = "N/A"
+    bounce_time = "N/A"
+    error = "None"
+
+    for p in parts[3:]:
+        if p.startswith('Subject:'):
+            subject = re.sub(r'^Subject:\s*', '', p).strip()
+        elif p.startswith('ID:') or p.startswith('Message-ID:'):
+            message_id = re.sub(r'^(?:ID|Message-ID):\s*', '', p).strip()
+        elif p.startswith('Submitted:'):
+            submitted_time = re.sub(r'^Submitted:\s*', '', p).strip()
+        elif p.startswith('Bounce:') or p.startswith('Bounce-Time:'):
+            bounce_time = re.sub(r'^(?:Bounce|Bounce-Time):\s*', '', p).strip()
+        elif p.startswith('Error:'):
+            error = re.sub(r'^Error:\s*', '', p).strip()
+
+    return {
+        'timestamp': orig_timestamp,
+        'recipient': recipient,
+        'status': status,
+        'subject': subject,
+        'message_id': message_id,
+        'submitted_time': submitted_time,
+        'bounce_time': bounce_time,
+        'error': error
+    }
+
+
+def load_outreach_history(log_path: str) -> Dict[str, Dict[str, Any]]:
+    """Load historical recipient outcomes from outreach.log.
+    Key is lowercase recipient address.
+    Tracks permanent/temporary bounces, last successful submission timestamp,
+    and last status.
+    Uses original submission timestamp (parts[0]) for cooldown calculations.
+    """
+    if not os.path.exists(log_path):
+        return {}
+
+    history: Dict[str, Dict[str, Any]] = {}
+    with open(log_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            entry = parse_log_line(line)
+            if not entry:
+                continue
+
+            email_key = entry['recipient'].lower().strip()
+            if not email_key:
+                continue
+
+            status = entry['status']
+            ts_dt = parse_log_timestamp(entry['timestamp'])
+            is_undelivered = status.startswith('UNDELIVERED') or status == 'BOUNCED'
+            is_successful_submission = (
+                status in ('SENT', 'SUBMITTED', 'UNKNOWN')
+                and not is_undelivered
+                and entry['bounce_time'] == 'N/A'
+            )
+
+            if email_key not in history:
+                history[email_key] = {
+                    'recipient': entry['recipient'],
+                    'is_undelivered': is_undelivered,
+                    'undelivered_status': status if is_undelivered else None,
+                    'last_submitted_dt': ts_dt if is_successful_submission else None,
+                    'last_status': status,
+                    'last_error': entry['error'],
+                    'entries': [entry]
+                }
+            else:
+                h = history[email_key]
+                h['entries'].append(entry)
+                h['last_status'] = status
+                h['last_error'] = entry['error']
+                if is_undelivered:
+                    h['is_undelivered'] = True
+                    h['undelivered_status'] = status
+                if is_successful_submission and ts_dt:
+                    if h['last_submitted_dt'] is None or ts_dt > h['last_submitted_dt']:
+                        h['last_submitted_dt'] = ts_dt
+
+    return history
+
+
+def evaluate_recipient_eligibility(
+    recipient: str,
+    history_map: Dict[str, Dict[str, Any]],
+    cooldown_days: int = 10,
+    cooldown_enabled: bool = True,
+    current_time: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """Evaluate whether an input recipient is eligible for outreach or should be skipped.
+    Rules:
+    - INVALID email format: skip until corrected.
+    - UNDELIVERED in history: skip and flag for manual review, regardless of age
+      (preserved even when cooldown is disabled).
+    - SENT within cooldown period: skip (show previous submission & eligible dates).
+    - SENT exactly cooldown_days ago or earlier: eligible to send.
+    - FAILED_TO_SUBMIT: eligible for retry.
+    - New recipient: eligible to send.
+    """
+    clean_email = recipient.strip()
+    if not is_valid_email(clean_email):
+        return {
+            'action': 'INVALID',
+            'reason': 'Invalid email address format; skipped until corrected',
+            'recipient': clean_email
+        }
+
+    email_key = clean_email.lower()
+    hist = history_map.get(email_key)
+
+    if hist:
+        # 1. UNDELIVERED in history: skip and flag for manual review, regardless of age
+        if hist.get('is_undelivered'):
+            return {
+                'action': 'UNDELIVERED_REVIEW',
+                'reason': f"Confirmed bounce: {hist.get('undelivered_status', 'UNDELIVERED')}",
+                'status': hist.get('undelivered_status', 'UNDELIVERED'),
+                'recipient': clean_email
+            }
+
+        # 2. Check cooldown for previously submitted emails
+        last_dt = hist.get('last_submitted_dt')
+        if last_dt is not None:
+            if cooldown_enabled:
+                now = current_time or datetime.now()
+                cooldown_delta = timedelta(days=cooldown_days)
+                elapsed = now - last_dt
+                if elapsed < cooldown_delta:
+                    # SENT within the last cooldown_days days: SKIP
+                    eligible_dt = last_dt + cooldown_delta
+                    return {
+                        'action': 'SKIP_COOLDOWN',
+                        'reason': f"Sent within {cooldown_days}-day cooldown",
+                        'submitted_date': last_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        'eligible_date': eligible_dt.strftime('%Y-%m-%d %H:%M:%S'),
+                        'last_submitted_dt': last_dt,
+                        'eligible_dt': eligible_dt,
+                        'recipient': clean_email
+                    }
+                else:
+                    # SENT exactly cooldown_days ago or earlier: eligible to send!
+                    return {
+                        'action': 'SEND',
+                        'reason': f"Sent >= {cooldown_days} days ago (cooldown expired)",
+                        'last_submitted_dt': last_dt,
+                        'recipient': clean_email
+                    }
+            else:
+                # Cooldown checking disabled: eligible to send
+                return {
+                    'action': 'SEND',
+                    'reason': "Duplicate cooldown check disabled; eligible to send",
+                    'last_submitted_dt': last_dt,
+                    'recipient': clean_email
+                }
+
+        # 3. FAILED_TO_SUBMIT: eligible for retry
+        if hist.get('last_status') == 'FAILED_TO_SUBMIT':
+            return {
+                'action': 'SEND',
+                'reason': 'Previous submission failed; eligible for retry',
+                'recipient': clean_email
+            }
+
+    # 4. New recipient not in history: eligible to send
+    return {
+        'action': 'SEND',
+        'reason': 'New recipient; eligible to send',
+        'recipient': clean_email
+    }
+
+
+def safe_clear_csv_queue(
+    csv_path: str,
+    safely_processed_emails: Set[str]
+) -> int:
+    """Safely update data/recruiter_contacts.csv temporary input queue.
+    Removes rows whose recipient emails have confirmed, safely recorded outcomes
+    (including skipped duplicates, undelivered review, invalid, and completed sends).
+    Preserves the header and any unprocessed rows or rows with uncertain outcomes.
+    If all input recipients were safely processed, leaves only the header.
+    Never clears at startup.
+    Thread-safe and crash-safe (via atomic temp-file replace and fsync).
+    Returns count of removed rows.
+    """
+    if not os.path.exists(csv_path) or not safely_processed_emails:
+        return 0
+
+    lower_safe = {e.lower().strip() for e in safely_processed_emails if e and isinstance(e, str) and e.strip()}
+    if not lower_safe:
+        return 0
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = list(csv.reader(f))
+    except Exception:
+        return 0
+
+    if not reader:
+        return 0
+
+    first_row = reader[0]
+    first_row_clean = [col.strip().lower() for col in first_row]
+    email_col_idx = 0
+    has_header = False
+
+    if any('email' in col or 'mail' in col or 'recipient' in col for col in first_row_clean):
+        has_header = True
+        for idx, col in enumerate(first_row_clean):
+            if 'email' in col or 'mail' in col or 'recipient' in col:
+                email_col_idx = idx
+                break
+
+    header_row = first_row if has_header else None
+    data_rows = reader[1:] if has_header else reader
+
+    remaining_data_rows = []
+    removed_count = 0
+
+    for row in data_rows:
+        if not row:
+            continue
+        row_email = row[email_col_idx].strip().lower() if len(row) > email_col_idx else ""
+        if row_email and row_email in lower_safe:
+            removed_count += 1
+        else:
+            remaining_data_rows.append(row)
+
+    # Atomic write to temporary file then replace
+    temp_csv = csv_path + ".tmp"
+    try:
+        with open(temp_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if header_row is not None:
+                writer.writerow(header_row)
+            for r in remaining_data_rows:
+                writer.writerow(r)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+
+        os.replace(temp_csv, csv_path)
+    except Exception:
+        if os.path.exists(temp_csv):
+            try:
+                os.remove(temp_csv)
+            except OSError:
+                pass
+        return 0
+
+    return removed_count
 
 
 class RecruiterDirectory:
@@ -652,12 +961,16 @@ class LiveDashboard:
         total_recipients: int,
         is_live: Optional[bool] = None,
         num_workers: int = 3,
-        refresh_rate: float = 4.0
+        refresh_rate: float = 4.0,
+        cooldown_days: int = 10,
+        cooldown_enabled: bool = True
     ):
         self.total_recipients = max(0, total_recipients)
         self.is_live = sys.stdout.isatty() if is_live is None else is_live
         self.num_workers = max(1, num_workers)
         self.min_render_interval = 1.0 / max(0.1, refresh_rate)
+        self.cooldown_days = max(1, cooldown_days)
+        self.cooldown_enabled = cooldown_enabled
         self._lock = threading.Lock()
         self.start_time = time.time()
         self.completed = 0
@@ -670,11 +983,19 @@ class LiveDashboard:
             for i in range(1, self.num_workers + 1)
         }
 
-        # Counters: exactly TWO user-facing delivery statuses
+        # Counters: required display metrics
         self.counters: Dict[str, int] = {
+            'TOTAL_INPUT': self.total_recipients,
+            'NEW_RECIPIENTS': 0,
+            'SKIPPED_COOLDOWN': 0,
+            'UNDELIVERED_REVIEW': 0,
+            'INVALID': 0,
+            'FAILED_TO_SUBMIT': 0,
             'SENT': 0,
             'UNDELIVERED': 0
         }
+        self.skipped_cooldown_recipients: List[Dict[str, Any]] = []
+        self.undelivered_review_recipients: List[Dict[str, Any]] = []
         self.undelivered_recipients: List[Dict[str, Any]] = []
         self.execution_errors: List[Dict[str, Any]] = []
 
@@ -697,6 +1018,14 @@ class LiveDashboard:
         with self._lock:
             self.counters[counter_name] = value
             self._render_locked()
+
+    def set_skipped_cooldown_recipients(self, records: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.skipped_cooldown_recipients = list(records)
+
+    def set_undelivered_review_recipients(self, records: List[Dict[str, Any]]) -> None:
+        with self._lock:
+            self.undelivered_review_recipients = list(records)
 
     def set_undelivered_recipients(self, records: List[Dict[str, Any]]) -> None:
         with self._lock:
@@ -734,8 +1063,10 @@ class LiveDashboard:
         filled = int(bar_len * (self.completed / self.total_recipients)) if self.total_recipients > 0 else bar_len
         bar = "█" * filled + "░" * (bar_len - filled)
 
+        cd_desc = f"{self.cooldown_days}-DAY COOLDOWN" if self.cooldown_enabled else "DISABLED"
         lines = [
             "======================= Recruiter Outreach Live Dashboard =======================",
+            f"Config: Workers={self.num_workers} | Duplicate Check={cd_desc}",
             f"Progress: [{bar}] {self.completed}/{self.total_recipients} ({pct:.1f}%) | Time: {elapsed_str} | Rate: {rate:.1f} msg/min",
             "--------------------------------- Worker Panels ---------------------------------"
         ]
@@ -745,7 +1076,9 @@ class LiveDashboard:
 
         lines.extend([
             "------------------------------------ Counters -----------------------------------",
-            f" SENT: {self.counters.get('SENT', 0)} | UNDELIVERED: {self.counters.get('UNDELIVERED', 0)}",
+            f" TOTAL INPUT: {self.total_recipients} | NEW RECIPIENTS: {self.counters.get('NEW_RECIPIENTS', 0)} | SENT: {self.counters.get('SENT', 0)}",
+            f" SKIPPED ({self.cooldown_days}-DAY COOLDOWN): {self.counters.get('SKIPPED_COOLDOWN', 0)} | UNDELIVERED REVIEW: {self.counters.get('UNDELIVERED_REVIEW', 0)}",
+            f" INVALID: {self.counters.get('INVALID', 0)} | FAILED TO SUBMIT: {self.counters.get('FAILED_TO_SUBMIT', 0)} | UNDELIVERED: {self.counters.get('UNDELIVERED', 0)}",
             "================================================================================="
         ])
 
@@ -773,20 +1106,47 @@ class LiveDashboard:
 
             sent_cnt = self.counters.get('SENT', 0)
             undelivered_cnt = self.counters.get('UNDELIVERED', 0)
+            skipped_cnt = self.counters.get('SKIPPED_COOLDOWN', 0)
+            review_cnt = self.counters.get('UNDELIVERED_REVIEW', 0)
+            invalid_cnt = self.counters.get('INVALID', 0)
+            failed_cnt = self.counters.get('FAILED_TO_SUBMIT', 0)
+            new_cnt = self.counters.get('NEW_RECIPIENTS', 0)
+
+            cd_str = f"ENABLED ({self.cooldown_days}-Day Cooldown)" if self.cooldown_enabled else "DISABLED"
 
             summary = [
                 "",
                 "=========================== Final Execution Summary ===========================",
-                f"Total Recipients:     {self.total_recipients}",
+                f"Duplicate Check:      {cd_str}",
+                f"Total Input:          {self.total_recipients}",
+                f"New Recipients:       {new_cnt}",
                 f"Processed:            {self.completed}",
                 f"Progress:             {pct:.1f}%",
                 f"Elapsed Time:         {elapsed_str}",
                 f"Processing Rate:      {rate:.1f} emails/min",
                 "",
                 "--- Status Counters ---",
+                f"TOTAL INPUT:          {self.total_recipients}",
+                f"NEW RECIPIENTS:       {new_cnt}",
+                f"SKIPPED ({self.cooldown_days}-DAY COOLDOWN): {skipped_cnt}",
+                f"UNDELIVERED REVIEW:   {review_cnt}",
+                f"INVALID:              {invalid_cnt}",
+                f"FAILED TO SUBMIT:     {failed_cnt}",
                 f"SENT:                 {sent_cnt}",
                 f"UNDELIVERED:          {undelivered_cnt}"
             ]
+
+            if self.skipped_cooldown_recipients:
+                summary.append("")
+                summary.append(f"--- Skipped Recipients ({self.cooldown_days}-Day Cooldown) ---")
+                for s in self.skipped_cooldown_recipients:
+                    summary.append(f"  - {s['recipient']}: Previous Submission: {s.get('submitted_date', 'N/A')} | Eligible Again: {s.get('eligible_date', 'N/A')}")
+
+            if self.undelivered_review_recipients:
+                summary.append("")
+                summary.append("--- Undelivered Review (Flagged for Manual Review) ---")
+                for u in self.undelivered_review_recipients:
+                    summary.append(f"  - {u['recipient']}: Status: {u.get('status', 'UNDELIVERED')}")
 
             undelivered = undelivered_recipients if undelivered_recipients is not None else self.undelivered_recipients
             if undelivered:
@@ -1379,7 +1739,8 @@ def process_recipients_concurrently(
     dashboard: Optional[LiveDashboard] = None,
     num_workers: Optional[int] = None,
     api_call_delay: Optional[float] = None,
-    config: Optional[Config] = None
+    config: Optional[Config] = None,
+    safely_processed_set: Optional[Set[str]] = None
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Process recipients across concurrent workers independently.
     Handles deduplication within run, validation, MIME creation, thread-safe sending,
@@ -1432,6 +1793,8 @@ def process_recipients_concurrently(
                     is_duplicate = False
 
             if is_duplicate:
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
                 if dashboard:
                     dashboard.increment_counter('SKIPPED')
                     dashboard.record_completed()
@@ -1454,9 +1817,12 @@ def process_recipients_concurrently(
                 if logging_active:
                     with log_lock:
                         logger.log_email_record(rec)
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
                 with records_lock:
                     all_records.append(rec)
                 if dashboard:
+                    dashboard.increment_counter('INVALID')
                     dashboard.add_execution_error(norm_email, 'Invalid email address format; skipped')
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
@@ -1493,6 +1859,9 @@ def process_recipients_concurrently(
                 if logging_active:
                     with log_lock:
                         logger.log_email_record(rec)
+
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
 
                 with records_lock:
                     all_records.append(rec)
@@ -1537,6 +1906,9 @@ def process_recipients_concurrently(
                     with log_lock:
                         logger.log_email_record(rec)
 
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
+
                 with records_lock:
                     all_records.append(rec)
                     submitted_records.append(rec)
@@ -1558,10 +1930,15 @@ def process_recipients_concurrently(
                 if logging_active:
                     with log_lock:
                         logger.log_email_record(rec)
+
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
+
                 with records_lock:
                     all_records.append(rec)
 
                 if dashboard:
+                    dashboard.increment_counter('FAILED_TO_SUBMIT')
                     dashboard.add_execution_error(norm_email, err_text)
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
@@ -1577,10 +1954,15 @@ def process_recipients_concurrently(
                 if logging_active:
                     with log_lock:
                         logger.log_email_record(rec)
+
+                if safely_processed_set is not None:
+                    safely_processed_set.add(lower_email)
+
                 with records_lock:
                     all_records.append(rec)
 
                 if dashboard:
+                    dashboard.increment_counter('FAILED_TO_SUBMIT')
                     dashboard.add_execution_error(norm_email, str(error))
                     dashboard.update_worker(slot, state='FAILED', recipient=norm_email)
                     dashboard.record_completed()
@@ -1610,6 +1992,13 @@ def main():
     logger = OutreachLogger(config.log_file) if config.logging_enabled else None
     directory = RecruiterDirectory(config.excel_directory_file) if config.excel_directory_enabled else None
 
+    # Startup status banner reflecting active settings
+    cd_status = f"ENABLED ({config.duplicate_cooldown_days}-Day Cooldown)" if config.duplicate_check_enabled else "DISABLED"
+    print("===============================================================================")
+    print(f"[*] Starting Recruiter Gmail Outreach Agent")
+    print(f"[*] Config: Workers={config.num_workers} | Duplicate Check={cd_status} | Dry Run={config.dry_run}")
+    print("===============================================================================")
+
     # 1. Check prerequisite files & parse template
     if not os.path.exists(config.resume_file):
         print(f"Error: Resume attachment '{config.resume_file}' not found.")
@@ -1630,7 +2019,7 @@ def main():
         print(f"Error: {e}")
         return
 
-    # 2. Read raw recruiter emails from CSV
+    # 2. Read raw recruiter emails from CSV (temporary input queue; never cleared at startup)
     try:
         raw_recipients = read_raw_recruiter_emails(config.recruiter_csv_file)
     except FileNotFoundError as e:
@@ -1642,9 +2031,72 @@ def main():
         print("No email addresses found in CSV.")
         return
 
-    # 3. Authenticate with Gmail API (skip if dry_run)
+    # 3. Pre-flight Duplicate & Eligibility check against outreach.log before worker assignment
+    history_map = load_outreach_history(config.log_file) if (config.logging_enabled and os.path.exists(config.log_file)) else {}
+
+    eligible_recipients: List[str] = []
+    skipped_cooldown_records: List[Dict[str, Any]] = []
+    undelivered_review_records: List[Dict[str, Any]] = []
+    invalid_records: List[Dict[str, Any]] = []
+    seen_in_input: Set[str] = set()
+    safely_processed: Set[str] = set()
+
+    for r_raw in raw_recipients:
+        r_clean = r_raw.strip()
+        r_lower = r_clean.lower()
+        if not r_clean:
+            continue
+
+        # Prevent queuing duplicates within the input queue in the same execution
+        if r_lower in seen_in_input:
+            safely_processed.add(r_lower)
+            continue
+        seen_in_input.add(r_lower)
+
+        eval_res = evaluate_recipient_eligibility(
+            recipient=r_clean,
+            history_map=history_map,
+            cooldown_days=config.duplicate_cooldown_days,
+            cooldown_enabled=config.duplicate_check_enabled
+        )
+
+        action = eval_res['action']
+        if action == 'SKIP_COOLDOWN':
+            skipped_cooldown_records.append({
+                'recipient': r_clean,
+                'submitted_date': eval_res.get('submitted_date', 'N/A'),
+                'eligible_date': eval_res.get('eligible_date', 'N/A'),
+                'reason': eval_res.get('reason', '')
+            })
+            safely_processed.add(r_lower)
+        elif action == 'UNDELIVERED_REVIEW':
+            undelivered_review_records.append({
+                'recipient': r_clean,
+                'status': eval_res.get('status', 'UNDELIVERED'),
+                'reason': eval_res.get('reason', '')
+            })
+            safely_processed.add(r_lower)
+        elif action == 'INVALID':
+            inv_rec = {
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'recipient': r_clean,
+                'status': 'INVALID',
+                'subject': subject,
+                'message_id': 'N/A',
+                'submitted_time': 'N/A',
+                'bounce_time': 'N/A',
+                'error': 'Invalid email address format; skipped'
+            }
+            if logger and config.logging_enabled:
+                logger.log_email_record(inv_rec)
+            invalid_records.append(inv_rec)
+            safely_processed.add(r_lower)
+        else: # SEND
+            eligible_recipients.append(r_clean)
+
+    # 4. Authenticate with Gmail API (skip if dry_run or no eligible recipients)
     service = None
-    if not config.dry_run:
+    if eligible_recipients and not config.dry_run:
         try:
             service = get_gmail_service(
                 credentials_file=config.gmail_credentials_file,
@@ -1653,70 +2105,96 @@ def main():
         except Exception as e:
             print(f"Authentication failed: {e}")
             return
-    else:
+    elif config.dry_run:
         print("Note: Running in DRY_RUN mode. Real emails will not be sent.")
 
-    # 4. Initialize dashboard if enabled
+    # 5. Initialize dashboard if enabled
     dashboard = None
     if config.dashboard_enabled:
         dashboard = LiveDashboard(
             total_recipients=total_recipients,
             num_workers=config.num_workers,
-            refresh_rate=config.dashboard_refresh_rate
+            refresh_rate=config.dashboard_refresh_rate,
+            cooldown_days=config.duplicate_cooldown_days,
+            cooldown_enabled=config.duplicate_check_enabled
         )
+        dashboard.set_counter('TOTAL_INPUT', total_recipients)
+        dashboard.set_counter('NEW_RECIPIENTS', len(eligible_recipients))
+        dashboard.set_counter('SKIPPED_COOLDOWN', len(skipped_cooldown_records))
+        dashboard.set_counter('UNDELIVERED_REVIEW', len(undelivered_review_records))
+        dashboard.set_counter('INVALID', len(invalid_records))
+        dashboard.set_skipped_cooldown_recipients(skipped_cooldown_records)
+        dashboard.set_undelivered_review_recipients(undelivered_review_records)
+        for inv in invalid_records:
+            dashboard.add_execution_error(inv['recipient'], inv['error'])
 
-    # 5. Process recipients concurrently
-    all_records, submitted_records = process_recipients_concurrently(
-        recipients=raw_recipients,
-        service=service,
-        subject=subject,
-        html_template=html_template,
-        resume_path=config.resume_file,
-        logger=logger,
-        directory=directory,
-        dashboard=dashboard,
-        config=config
-    )
+    all_records: List[Dict[str, Any]] = list(invalid_records)
+    submitted_records: List[Dict[str, Any]] = []
 
-    # 6. Check for Bounces (Current run + Delayed bounces from previous unconfirmed emails)
-    if config.bounce_check_enabled and service and not config.dry_run:
-        cached_bounces: List[Dict[str, Any]] = []
-        if submitted_records:
-            detect_bounces(
-                service,
-                submitted_records,
+    try:
+        # 6. Process eligible recipients concurrently across 3 workers
+        if eligible_recipients:
+            worker_all, worker_sub = process_recipients_concurrently(
+                recipients=eligible_recipients,
+                service=service,
+                subject=subject,
+                html_template=html_template,
+                resume_path=config.resume_file,
                 logger=logger,
                 directory=directory,
-                delay_seconds=config.bounce_check_delay_seconds,
-                cached_bounces=cached_bounces,
-                config=config
+                dashboard=dashboard,
+                config=config,
+                safely_processed_set=safely_processed
             )
+            all_records.extend(worker_all)
+            submitted_records.extend(worker_sub)
 
-        if logger:
-            try:
-                prev_unconfirmed = logger.get_unconfirmed_records()
-                curr_emails = {r['recipient'].lower() for r in submitted_records}
-                prev_to_check = [r for r in prev_unconfirmed if r['recipient'].lower() not in curr_emails]
-                if prev_to_check:
-                    detect_bounces(
-                        service,
-                        prev_to_check,
-                        logger=logger,
-                        directory=directory,
-                        delay_seconds=0,
-                        cached_bounces=cached_bounces if cached_bounces else None,
-                        config=config
-                    )
-            except Exception:
-                pass
+        # 7. Check for Bounces (Current run + Delayed bounces from previous unconfirmed emails)
+        if config.bounce_check_enabled and service and not config.dry_run:
+            cached_bounces: List[Dict[str, Any]] = []
+            if submitted_records:
+                detect_bounces(
+                    service,
+                    submitted_records,
+                    logger=logger,
+                    directory=directory,
+                    delay_seconds=config.bounce_check_delay_seconds,
+                    cached_bounces=cached_bounces,
+                    config=config
+                )
 
-    # 7. Final Summary
+            if logger:
+                try:
+                    prev_unconfirmed = logger.get_unconfirmed_records()
+                    curr_emails = {r['recipient'].lower() for r in submitted_records}
+                    prev_to_check = [r for r in prev_unconfirmed if r['recipient'].lower() not in curr_emails]
+                    if prev_to_check:
+                        detect_bounces(
+                            service,
+                            prev_to_check,
+                            logger=logger,
+                            directory=directory,
+                            delay_seconds=0,
+                            cached_bounces=cached_bounces if cached_bounces else None,
+                            config=config
+                        )
+                except Exception:
+                    pass
+
+    finally:
+        # 8. Safe CSV auto-clear: clear safely processed recipient rows while preserving header and unprocessed rows
+        if safely_processed and os.path.exists(config.recruiter_csv_file):
+            safe_clear_csv_queue(config.recruiter_csv_file, safely_processed)
+
+    # 9. Final Summary
     undelivered_records = [
         r for r in submitted_records
         if str(r.get('status', '')).startswith('UNDELIVERED') or r.get('status') == 'BOUNCED'
     ]
     sent_count = max(0, len(submitted_records) - len(undelivered_records))
     undelivered_count = len(undelivered_records)
+    failed_submit_count = sum(1 for r in all_records if r.get('status') == 'FAILED_TO_SUBMIT')
+
     execution_errors = [
         r for r in all_records
         if r.get('status') in ('FAILED_TO_SUBMIT', 'INVALID')
@@ -1725,6 +2203,7 @@ def main():
     if dashboard:
         dashboard.set_counter('SENT', sent_count)
         dashboard.set_counter('UNDELIVERED', undelivered_count)
+        dashboard.set_counter('FAILED_TO_SUBMIT', failed_submit_count)
         dashboard.set_undelivered_recipients(undelivered_records)
         dashboard.set_execution_errors(execution_errors)
         dashboard.render_final_summary(
@@ -1732,19 +2211,38 @@ def main():
             excel_path=config.excel_directory_file if config.excel_directory_enabled else "Disabled"
         )
     else:
-        print("\n=== Execution Summary ===")
-        print(f"Total Recipients:     {total_recipients}")
+        print("\n=== Final Execution Summary ===")
+        print(f"Duplicate Check:      {cd_status}")
+        print(f"Total Input:          {total_recipients}")
+        print(f"New Recipients:       {len(eligible_recipients)}")
+        print(f"SKIPPED ({config.duplicate_cooldown_days}-DAY COOLDOWN):   {len(skipped_cooldown_records)}")
+        print(f"UNDELIVERED REVIEW:   {len(undelivered_review_records)}")
+        print(f"INVALID:              {len(invalid_records)}")
+        print(f"FAILED TO SUBMIT:     {failed_submit_count}")
         print(f"SENT:                 {sent_count}")
         print(f"UNDELIVERED:          {undelivered_count}")
+
+        if skipped_cooldown_records:
+            print(f"\n--- Skipped Recipients ({config.duplicate_cooldown_days}-Day Cooldown) ---")
+            for scr in skipped_cooldown_records:
+                print(f"  - {scr['recipient']}: Previous Submission: {scr['submitted_date']} | Eligible Again: {scr['eligible_date']}")
+
+        if undelivered_review_records:
+            print("\n--- Undelivered Review (Flagged for Manual Review) ---")
+            for urr in undelivered_review_records:
+                print(f"  - {urr['recipient']}: Status: {urr['status']}")
+
         if undelivered_records:
             print("\n--- Undelivered Recipients ---")
             for ur in undelivered_records:
                 print(f"Recipient: {ur['recipient']}")
                 print(f"Status: {ur['status']}")
+
         if execution_errors:
             print("\n--- Execution Error Details ---")
             for ee in execution_errors:
                 print(f"  - {ee['recipient']}: {ee.get('error', 'Error')}")
+
         if config.logging_enabled:
             print(f"\nLogs:                 {config.log_file}")
         if config.excel_directory_enabled:

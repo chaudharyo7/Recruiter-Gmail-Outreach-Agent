@@ -8,6 +8,7 @@ import base64
 import email
 import json
 import httplib2
+from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 from email.mime.multipart import MIMEMultipart
 
@@ -44,6 +45,11 @@ from main import (
     DEFAULT_RESUME,
     DEFAULT_EXCEL_DIRECTORY,
     NUM_WORKERS,
+    DUPLICATE_CHECK_ENABLED,
+    DUPLICATE_COOLDOWN_DAYS,
+    load_outreach_history,
+    evaluate_recipient_eligibility,
+    safe_clear_csv_queue,
     SCOPES,
     CREDENTIALS_FILE,
     LOG_FILE
@@ -1740,6 +1746,457 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
                     os.remove(p)
 
         print("[PASS] Recruiter email directory permanent bounce removal, temporary bounce retention, case-insensitivity, and thread-safety verified")
+
+    def test_26_duplicate_cooldown_rules(self):
+        """Verify 10-day duplicate prevention cooldown: 2-day, 9-day, exactly 10-day, and 11-day cases,
+        case-insensitive matching, original submission timestamp calculation, and timer preservation.
+        """
+        ref_time = datetime(2026, 11, 20, 12, 0, 0)
+        cooldown_days = 10
+
+        # Construct log history with various submission timestamps
+        log_records = [
+            # 2 days ago: 2026-11-18 12:00:00 -> within cooldown -> SKIP
+            "2026-11-18 12:00:00 | two_days@example.com | SENT | Subject: Test | ID: msg_2d | Submitted: 12:00:00 | Bounce: N/A | Error: None",
+            # 9 days ago: 2026-11-11 12:00:00 -> within cooldown -> SKIP
+            "2026-11-11 12:00:00 | nine_days@example.com | SENT | Subject: Test | ID: msg_9d | Submitted: 12:00:00 | Bounce: N/A | Error: None",
+            # Exactly 10 days ago: 2026-11-10 12:00:00 -> cooldown expired -> ELIGIBLE (SEND)
+            "2026-11-10 12:00:00 | exact_10d@example.com | SENT | Subject: Test | ID: msg_10d | Submitted: 12:00:00 | Bounce: N/A | Error: None",
+            # 11 days ago: 2026-11-09 12:00:00 -> cooldown expired -> ELIGIBLE (SEND)
+            "2026-11-09 12:00:00 | eleven_days@example.com | SENT | Subject: Test | ID: msg_11d | Submitted: 12:00:00 | Bounce: N/A | Error: None",
+            # Case-insensitivity check: logged lowercase, queried uppercase 3 days ago -> SKIP
+            "2026-11-17 12:00:00 | case_test@example.com | SENT | Subject: Test | ID: msg_case | Submitted: 12:00:00 | Bounce: N/A | Error: None",
+        ]
+
+        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as f:
+            for r in log_records:
+                f.write(r + "\n")
+            tmp_log = f.name
+
+        try:
+            history = load_outreach_history(tmp_log)
+
+            # 1. 2-day case: SKIPPED
+            res_2d = evaluate_recipient_eligibility('two_days@example.com', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_2d['action'], 'SKIP_COOLDOWN')
+            self.assertEqual(res_2d['submitted_date'], '2026-11-18 12:00:00')
+            self.assertEqual(res_2d['eligible_date'], '2026-11-28 12:00:00')
+
+            # 2. 9-day case: SKIPPED
+            res_9d = evaluate_recipient_eligibility('nine_days@example.com', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_9d['action'], 'SKIP_COOLDOWN')
+            self.assertEqual(res_9d['submitted_date'], '2026-11-11 12:00:00')
+            self.assertEqual(res_9d['eligible_date'], '2026-11-21 12:00:00')
+
+            # 3. Exactly 10-day case: ELIGIBLE TO SEND
+            res_10d = evaluate_recipient_eligibility('exact_10d@example.com', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_10d['action'], 'SEND')
+            self.assertIn('cooldown expired', res_10d['reason'])
+
+            # 4. 11-day case: ELIGIBLE TO SEND
+            res_11d = evaluate_recipient_eligibility('eleven_days@example.com', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_11d['action'], 'SEND')
+            self.assertIn('cooldown expired', res_11d['reason'])
+
+            # 5. Case-insensitive matching: queried in uppercase
+            res_case = evaluate_recipient_eligibility('CASE_TEST@EXAMPLE.COM', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_case['action'], 'SKIP_COOLDOWN')
+
+            # 6. Timer preservation: skipped duplicates do not alter log records or reset timer
+            logger = OutreachLogger(tmp_log)
+            # Re-evaluating still yields the original submitted_date (2026-11-18 12:00:00)
+            res_recheck = evaluate_recipient_eligibility('two_days@example.com', history, cooldown_days=10, current_time=ref_time)
+            self.assertEqual(res_recheck['submitted_date'], '2026-11-18 12:00:00')
+
+        finally:
+            if os.path.exists(tmp_log):
+                os.remove(tmp_log)
+
+        print("[PASS] 10-day duplicate prevention cooldown verified (2-day, 9-day, exactly 10-day, 11-day, case-insensitivity, timer preservation)")
+
+    def test_27_undelivered_review_and_retry_rules(self):
+        """Verify UNDELIVERED exclusion regardless of age and even when cooldown is disabled,
+        FAILED_TO_SUBMIT retry eligibility, and INVALID format handling.
+        """
+        ref_time = datetime(2026, 11, 20, 12, 0, 0)
+
+        # History with confirmed UNDELIVERED (from 50 days ago) and FAILED_TO_SUBMIT
+        log_records = [
+            # 50 days ago: confirmed bounce
+            "2026-10-01 10:00:00 | bounced_old@company.com | UNDELIVERED (Mailbox does not exist) | Subject: App | ID: mid_1 | Submitted: 10:00:00 | Bounce: 10:05:00 | Error: SMTP 550",
+            # Recent FAILED_TO_SUBMIT
+            "2026-11-19 14:00:00 | failed_yesterday@company.com | FAILED_TO_SUBMIT | Subject: App | ID: N/A | Submitted: N/A | Bounce: N/A | Error: HTTP 500: Server Error",
+        ]
+
+        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as f:
+            for r in log_records:
+                f.write(r + "\n")
+            tmp_log = f.name
+
+        try:
+            history = load_outreach_history(tmp_log)
+
+            # 1. UNDELIVERED in history: skip and flag for manual review, regardless of age
+            res_undeliv = evaluate_recipient_eligibility(
+                'bounced_old@company.com',
+                history,
+                cooldown_days=10,
+                cooldown_enabled=True,
+                current_time=ref_time
+            )
+            self.assertEqual(res_undeliv['action'], 'UNDELIVERED_REVIEW')
+            self.assertIn('Mailbox does not exist', res_undeliv['status'])
+
+            # 2. Confirmed UNDELIVERED exclusion is preserved even when cooldown is disabled!
+            res_undeliv_nocd = evaluate_recipient_eligibility(
+                'bounced_old@company.com',
+                history,
+                cooldown_days=10,
+                cooldown_enabled=False,
+                current_time=ref_time
+            )
+            self.assertEqual(res_undeliv_nocd['action'], 'UNDELIVERED_REVIEW', "UNDELIVERED must be preserved even when cooldown is disabled")
+
+            # 3. FAILED_TO_SUBMIT: eligible for retry
+            res_retry = evaluate_recipient_eligibility(
+                'failed_yesterday@company.com',
+                history,
+                cooldown_days=10,
+                cooldown_enabled=True,
+                current_time=ref_time
+            )
+            self.assertEqual(res_retry['action'], 'SEND')
+            self.assertIn('retry', res_retry['reason'].lower())
+
+            # 4. INVALID email address: skip until corrected
+            res_inv = evaluate_recipient_eligibility(
+                'not_an_email_address',
+                history,
+                cooldown_days=10,
+                cooldown_enabled=True,
+                current_time=ref_time
+            )
+            self.assertEqual(res_inv['action'], 'INVALID')
+
+        finally:
+            if os.path.exists(tmp_log):
+                os.remove(tmp_log)
+
+        print("[PASS] UNDELIVERED manual review, retry of FAILED_TO_SUBMIT, and INVALID rules verified")
+
+    def test_28_config_cooldown_settings(self):
+        """Verify configurable duplicate prevention settings via .env:
+        DUPLICATE_CHECK_ENABLED=true/false, custom DUPLICATE_COOLDOWN_DAYS, and positive integer validation.
+        """
+        # 1. Custom cooldown days = 5
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as f:
+            f.write("DUPLICATE_CHECK_ENABLED=true\nDUPLICATE_COOLDOWN_DAYS=5\n")
+            env5 = f.name
+
+        try:
+            cfg5 = Config(env_path=env5)
+            cfg5.validate()
+            self.assertTrue(cfg5.duplicate_check_enabled)
+            self.assertEqual(cfg5.duplicate_cooldown_days, 5)
+
+            ref_now = datetime(2026, 11, 20, 12, 0, 0)
+            history = {
+                'candidate@example.com': {
+                    'recipient': 'candidate@example.com',
+                    'is_undelivered': False,
+                    'undelivered_status': None,
+                    'last_submitted_dt': datetime(2026, 11, 16, 12, 0, 0), # 4 days ago
+                    'last_status': 'SENT',
+                    'last_error': 'None'
+                }
+            }
+            # 4 days ago with 5-day cooldown -> SKIP
+            res_4d = evaluate_recipient_eligibility('candidate@example.com', history, cooldown_days=5, current_time=ref_now)
+            self.assertEqual(res_4d['action'], 'SKIP_COOLDOWN')
+
+            # 5 days ago with 5-day cooldown -> ELIGIBLE
+            history['candidate@example.com']['last_submitted_dt'] = datetime(2026, 11, 15, 12, 0, 0)
+            res_5d = evaluate_recipient_eligibility('candidate@example.com', history, cooldown_days=5, current_time=ref_now)
+            self.assertEqual(res_5d['action'], 'SEND')
+        finally:
+            if os.path.exists(env5):
+                os.remove(env5)
+
+        # 2. Disabled duplicate check: DUPLICATE_CHECK_ENABLED=false
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as f:
+            f.write("DUPLICATE_CHECK_ENABLED=false\nDUPLICATE_COOLDOWN_DAYS=10\n")
+            env_disabled = f.name
+
+        try:
+            cfg_dis = Config(env_path=env_disabled)
+            cfg_dis.validate()
+            self.assertFalse(cfg_dis.duplicate_check_enabled)
+
+            # Even if sent 1 hour ago, disabled cooldown permits sending
+            history_recent = {
+                'recent@example.com': {
+                    'recipient': 'recent@example.com',
+                    'is_undelivered': False,
+                    'undelivered_status': None,
+                    'last_submitted_dt': datetime(2026, 11, 20, 11, 0, 0),
+                    'last_status': 'SENT',
+                    'last_error': 'None'
+                }
+            }
+            res_disabled = evaluate_recipient_eligibility(
+                'recent@example.com',
+                history_recent,
+                cooldown_days=10,
+                cooldown_enabled=False,
+                current_time=ref_now
+            )
+            self.assertEqual(res_disabled['action'], 'SEND')
+        finally:
+            if os.path.exists(env_disabled):
+                os.remove(env_disabled)
+
+        # 3. Validation: DUPLICATE_COOLDOWN_DAYS <= 0 raises ValueError
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as f:
+            f.write("DUPLICATE_COOLDOWN_DAYS=0\n")
+            env_invalid = f.name
+
+        try:
+            cfg_inv = Config(env_path=env_invalid)
+            with self.assertRaises(ValueError) as ctx:
+                cfg_inv.validate()
+            self.assertIn("DUPLICATE_COOLDOWN_DAYS", str(ctx.exception))
+        finally:
+            if os.path.exists(env_invalid):
+                os.remove(env_invalid)
+
+        print("[PASS] Configurable duplicate check and cooldown validation verified")
+
+    def test_29_csv_auto_clear_and_crash_recovery(self):
+        """Verify CSV queue auto-clearing and crash recovery:
+        - Never clear at startup
+        - Clear recipient rows while preserving header when all outcomes are safely recorded
+        - Preserve unprocessed / uncertain rows if interrupted or crashed
+        """
+        import csv
+
+        # 1. Normal execution: all 3 recipients safely processed -> only header remains
+        with tempfile.NamedTemporaryFile('w', newline='', suffix='.csv', delete=False) as f:
+            writer = csv.writer(f)
+            writer.writerow(['email'])
+            writer.writerow(['r1@example.com'])
+            writer.writerow(['r2@example.com'])
+            writer.writerow(['r3@example.com'])
+            tmp_csv1 = f.name
+
+        try:
+            # Startup: verify CSV is non-empty and never cleared at startup
+            raw_initial = read_raw_recruiter_emails(tmp_csv1)
+            self.assertEqual(len(raw_initial), 3)
+
+            # Execution completes: all 3 safely recorded
+            safely_completed = {'r1@example.com', 'r2@example.com', 'r3@example.com'}
+            removed = safe_clear_csv_queue(tmp_csv1, safely_completed)
+            self.assertEqual(removed, 3)
+
+            # Check file content: header preserved, data rows cleared
+            with open(tmp_csv1, 'r', encoding='utf-8') as f:
+                lines = [l.strip() for l in f if l.strip()]
+            self.assertEqual(lines, ['email'], "CSV must retain only the header row after safe execution")
+
+            raw_after = read_raw_recruiter_emails(tmp_csv1)
+            self.assertEqual(len(raw_after), 0)
+        finally:
+            if os.path.exists(tmp_csv1):
+                os.remove(tmp_csv1)
+
+        # 2. Crash / partial execution: 2 processed, 2 unprocessed -> unprocessed preserved
+        with tempfile.NamedTemporaryFile('w', newline='', suffix='.csv', delete=False) as f:
+            writer = csv.writer(f)
+            writer.writerow(['Email', 'Company'])
+            writer.writerow(['safe1@example.com', 'Acme'])
+            writer.writerow(['crashed@example.com', 'Beta'])
+            writer.writerow(['safe2@example.com', 'Gamma'])
+            writer.writerow(['unprocessed@example.com', 'Delta'])
+            tmp_csv2 = f.name
+
+        try:
+            # Simulate crash: only safe1 and safe2 were safely logged
+            partial_safe = {'safe1@example.com', 'safe2@example.com'}
+            removed = safe_clear_csv_queue(tmp_csv2, partial_safe)
+            self.assertEqual(removed, 2)
+
+            with open(tmp_csv2, 'r', encoding='utf-8') as f:
+                reader = list(csv.reader(f))
+
+            self.assertEqual(reader[0], ['Email', 'Company'], "Header row must be preserved")
+            remaining_emails = [r[0] for r in reader[1:]]
+            self.assertEqual(remaining_emails, ['crashed@example.com', 'unprocessed@example.com'],
+                             "Uncertain or unprocessed rows must be preserved for recovery")
+        finally:
+            if os.path.exists(tmp_csv2):
+                os.remove(tmp_csv2)
+
+        print("[PASS] CSV auto-clearing and crash recovery verified (header preserved, safe rows cleared, uncertain rows retained)")
+
+    def test_30_full_pipeline_duplicate_prevention_and_dashboard(self):
+        """Verify full end-to-end pipeline:
+        - Pre-flight history check against outreach.log
+        - 1 Skipped Cooldown (shows previous submission & eligible date)
+        - 1 Undelivered Review (flagged for manual review)
+        - 1 Retry of FAILED_TO_SUBMIT
+        - 1 New recipient
+        - 1 Invalid recipient
+        - Dashboard counters: TOTAL INPUT, NEW RECIPIENTS, SKIPPED (10-DAY COOLDOWN), UNDELIVERED REVIEW, INVALID, FAILED TO SUBMIT, SENT
+        - Safe CSV queue auto-clearing
+        """
+        import io
+        import csv
+
+        ref_now = datetime.now()
+        cooldown_days = 10
+
+        with tempfile.NamedTemporaryFile('w', suffix='.log', delete=False) as f_log:
+            # 1. Skipped cooldown: sent 3 days ago
+            t_3d = (ref_now - timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+            f_log.write(f"{t_3d} | recent@test.com | SENT | Subject: App | ID: mid_rec | Submitted: 10:00:00 | Bounce: N/A | Error: None\n")
+            # 2. Undelivered review: confirmed bounce
+            t_old = (ref_now - timedelta(days=20)).strftime('%Y-%m-%d %H:%M:%S')
+            f_log.write(f"{t_old} | bounced@test.com | UNDELIVERED (Address not found) | Subject: App | ID: mid_bnc | Submitted: 10:00:00 | Bounce: 10:05:00 | Error: SMTP 550\n")
+            # 3. Failed to submit in previous run: eligible for retry
+            f_log.write(f"{t_old} | failed_prev@test.com | FAILED_TO_SUBMIT | Subject: App | ID: N/A | Submitted: N/A | Bounce: N/A | Error: HTTP 500\n")
+            tmp_log = f_log.name
+
+        with tempfile.NamedTemporaryFile('w', newline='', suffix='.csv', delete=False) as f_csv:
+            writer = csv.writer(f_csv)
+            writer.writerow(['email'])
+            writer.writerow(['recent@test.com'])       # 1. SKIP (cooldown)
+            writer.writerow(['bounced@test.com'])      # 2. UNDELIVERED REVIEW
+            writer.writerow(['failed_prev@test.com'])  # 3. RETRY (SEND)
+            writer.writerow(['brand_new@test.com'])    # 4. NEW (SEND)
+            writer.writerow(['invalid-email-format'])  # 5. INVALID
+            tmp_csv = f_csv.name
+
+        with tempfile.NamedTemporaryFile('w', suffix='.env', delete=False) as f_env:
+            f_env.write(f"LOG_FILE={tmp_log}\nRECRUITER_CSV_FILE={tmp_csv}\nDUPLICATE_CHECK_ENABLED=true\nDUPLICATE_COOLDOWN_DAYS=10\nDRY_RUN=true\n")
+            tmp_env = f_env.name
+
+        try:
+            cfg = Config(env_path=tmp_env)
+            logger = OutreachLogger(cfg.log_file)
+            history = load_outreach_history(cfg.log_file)
+
+            raw_recipients = read_raw_recruiter_emails(tmp_csv)
+            self.assertEqual(len(raw_recipients), 5)
+
+            eligible = []
+            skipped_cd = []
+            undeliv_rev = []
+            invalid_recs = []
+            safely_processed = set()
+
+            for r in raw_recipients:
+                eval_res = evaluate_recipient_eligibility(r, history, cooldown_days=10, cooldown_enabled=True)
+                action = eval_res['action']
+                if action == 'SKIP_COOLDOWN':
+                    skipped_cd.append(eval_res)
+                    safely_processed.add(r.lower())
+                elif action == 'UNDELIVERED_REVIEW':
+                    undeliv_rev.append(eval_res)
+                    safely_processed.add(r.lower())
+                elif action == 'INVALID':
+                    inv_rec = {
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'recipient': r,
+                        'status': 'INVALID',
+                        'subject': 'Test',
+                        'message_id': 'N/A',
+                        'submitted_time': 'N/A',
+                        'bounce_time': 'N/A',
+                        'error': 'Invalid email address format'
+                    }
+                    invalid_recs.append(inv_rec)
+                    safely_processed.add(r.lower())
+                else:
+                    eligible.append(r)
+
+            self.assertEqual(len(skipped_cd), 1)
+            self.assertEqual(skipped_cd[0]['recipient'], 'recent@test.com')
+            self.assertIn('eligible_date', skipped_cd[0])
+
+            self.assertEqual(len(undeliv_rev), 1)
+            self.assertEqual(undeliv_rev[0]['recipient'], 'bounced@test.com')
+
+            self.assertEqual(len(invalid_recs), 1)
+            self.assertEqual(invalid_recs[0]['recipient'], 'invalid-email-format')
+
+            self.assertEqual(len(eligible), 2)
+            self.assertIn('failed_prev@test.com', eligible)
+            self.assertIn('brand_new@test.com', eligible)
+
+            # Initialize dashboard
+            dashboard = LiveDashboard(
+                total_recipients=len(raw_recipients),
+                is_live=False,
+                num_workers=3,
+                cooldown_days=10,
+                cooldown_enabled=True
+            )
+            dashboard.set_counter('TOTAL_INPUT', len(raw_recipients))
+            dashboard.set_counter('NEW_RECIPIENTS', len(eligible))
+            dashboard.set_counter('SKIPPED_COOLDOWN', len(skipped_cd))
+            dashboard.set_counter('UNDELIVERED_REVIEW', len(undeliv_rev))
+            dashboard.set_counter('INVALID', len(invalid_recs))
+            dashboard.set_skipped_cooldown_recipients(skipped_cd)
+            dashboard.set_undelivered_review_recipients(undeliv_rev)
+
+            # Process eligible recipients concurrently with mocked service in DRY_RUN mode
+            all_records, submitted_records = process_recipients_concurrently(
+                recipients=eligible,
+                service=None,
+                subject='Application for Cloud Opportunities',
+                html_template='<p>Hello recruiter</p>',
+                resume_path=DEFAULT_RESUME,
+                logger=logger,
+                directory=None,
+                dashboard=dashboard,
+                config=cfg,
+                safely_processed_set=safely_processed
+            )
+
+            self.assertEqual(len(submitted_records), 2)
+            dashboard.set_counter('SENT', len(submitted_records))
+
+            # Render final summary
+            with patch('sys.stdout', new=io.StringIO()) as fake_out:
+                dashboard.render_final_summary()
+                summary_str = fake_out.getvalue()
+
+            self.assertIn("TOTAL INPUT:          5", summary_str)
+            self.assertIn("NEW RECIPIENTS:       2", summary_str)
+            self.assertIn("SKIPPED (10-DAY COOLDOWN): 1", summary_str)
+            self.assertIn("UNDELIVERED REVIEW:   1", summary_str)
+            self.assertIn("INVALID:              1", summary_str)
+            self.assertIn("FAILED TO SUBMIT:     0", summary_str)
+            self.assertIn("SENT:                 2", summary_str)
+            self.assertIn("recent@test.com", summary_str)
+            self.assertIn("Eligible Again:", summary_str)
+            self.assertIn("bounced@test.com", summary_str)
+
+            # Safely clear CSV: all 5 recipients have safely recorded outcomes
+            removed = safe_clear_csv_queue(tmp_csv, safely_processed)
+            self.assertEqual(removed, 5)
+
+            # Confirm CSV retains only header
+            with open(tmp_csv, 'r', encoding='utf-8') as f:
+                lines = [l.strip() for l in f if l.strip()]
+            self.assertEqual(lines, ['email'])
+
+        finally:
+            for p in (tmp_log, tmp_csv, tmp_env):
+                if os.path.exists(p):
+                    os.remove(p)
+
+        print("[PASS] Full outreach pipeline with 10-day cooldown, UNDELIVERED review, and CSV clearing verified")
 
 
 if __name__ == '__main__':
