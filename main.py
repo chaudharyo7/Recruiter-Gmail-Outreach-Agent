@@ -6,6 +6,7 @@ import time
 import html
 import queue
 import base64
+import warnings
 import threading
 import concurrent.futures
 from datetime import datetime, timedelta
@@ -13,6 +14,15 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 from typing import List, Tuple, Dict, Any, Optional, Set
+
+# Suppress known harmless startup dependency warnings before importing affected libraries
+warnings.filterwarnings('ignore', message=r'.*OpenSSL.*', module=r'urllib3(\..*)?')
+warnings.filterwarnings('ignore', category=FutureWarning, module=r'google\..*')
+try:
+    from urllib3.exceptions import NotOpenSSLWarning
+    warnings.filterwarnings('ignore', category=NotOpenSSLWarning)
+except ImportError:
+    pass
 
 try:
     import openpyxl
@@ -245,6 +255,20 @@ def sanitize_log_field(text: Any) -> str:
         return "None"
     s = html.unescape(str(text)).replace('\r', ' ').replace('\n', ' ').strip()
     return re.sub(r'\s+', ' ', s) if s else "None"
+
+
+def format_display_text(text: Any, max_len: Optional[int] = None) -> str:
+    """Clean and decode text for terminal presentation:
+    Unescape HTML entities (e.g. &#39; -> '), strip carriage returns/newlines,
+    normalize whitespace, and optionally truncate for clean narrow terminal windows.
+    """
+    if text is None:
+        return "None"
+    s = html.unescape(str(text)).replace('\r', ' ').replace('\n', ' ').strip()
+    s = re.sub(r'\s+', ' ', s) if s else "None"
+    if max_len and len(s) > max_len:
+        return s[:max_len - 3] + "..."
+    return s
 
 
 def format_email_log_line(
@@ -1059,27 +1083,42 @@ class LiveDashboard:
         mins, secs = divmod(int(elapsed), 60)
         elapsed_str = f"{mins:02d}:{secs:02d}"
 
-        bar_len = 25
+        bar_len = 20
         filled = int(bar_len * (self.completed / self.total_recipients)) if self.total_recipients > 0 else bar_len
         bar = "█" * filled + "░" * (bar_len - filled)
 
-        cd_desc = f"{self.cooldown_days}-DAY COOLDOWN" if self.cooldown_enabled else "DISABLED"
         lines = [
-            "======================= Recruiter Outreach Live Dashboard =======================",
-            f"Config: Workers={self.num_workers} | Duplicate Check={cd_desc}",
-            f"Progress: [{bar}] {self.completed}/{self.total_recipients} ({pct:.1f}%) | Time: {elapsed_str} | Rate: {rate:.1f} msg/min",
-            "--------------------------------- Worker Panels ---------------------------------"
+            f"Progress: [{bar}] {self.completed}/{self.total_recipients} ({pct:.1f}%)  •  Elapsed: {elapsed_str}  •  Rate: {rate:.1f} msg/min"
         ]
-        for w_id in range(1, self.num_workers + 1):
-            w = self.workers.get(w_id, {'state': 'IDLE', 'recipient': '-'})
-            lines.append(f" [Worker {w_id}] State: {w['state']:<10} | Current: {w['recipient']}")
+
+        # Compact worker panel: show active workers when processing; compact single-line when all idle
+        active_workers = [
+            (w_id, w['state'], w['recipient'])
+            for w_id, w in self.workers.items()
+            if w.get('state') != 'IDLE'
+        ]
+        if active_workers:
+            for w_id, st, rec in active_workers:
+                disp_rec = format_display_text(rec, max_len=40)
+                lines.append(f"  Worker {w_id}: {st:<10} {disp_rec}")
+        else:
+            lines.append("  Workers: idle")
+
+        # Compact, properly aligned 8-counter grid (55 chars wide, fits narrow terminals)
+        total_in = self.total_recipients
+        new_rec = self.counters.get('NEW_RECIPIENTS', 0)
+        sent_cnt = self.counters.get('SENT', 0)
+        undeliv_cnt = self.counters.get('UNDELIVERED', 0)
+        skip_cnt = self.counters.get('SKIPPED_COOLDOWN', 0)
+        rev_cnt = self.counters.get('UNDELIVERED_REVIEW', 0)
+        inv_cnt = self.counters.get('INVALID', 0)
+        fail_cnt = self.counters.get('FAILED_TO_SUBMIT', 0)
 
         lines.extend([
-            "------------------------------------ Counters -----------------------------------",
-            f" TOTAL INPUT: {self.total_recipients} | NEW RECIPIENTS: {self.counters.get('NEW_RECIPIENTS', 0)} | SENT: {self.counters.get('SENT', 0)}",
-            f" SKIPPED ({self.cooldown_days}-DAY COOLDOWN): {self.counters.get('SKIPPED_COOLDOWN', 0)} | UNDELIVERED REVIEW: {self.counters.get('UNDELIVERED_REVIEW', 0)}",
-            f" INVALID: {self.counters.get('INVALID', 0)} | FAILED TO SUBMIT: {self.counters.get('FAILED_TO_SUBMIT', 0)} | UNDELIVERED: {self.counters.get('UNDELIVERED', 0)}",
-            "================================================================================="
+            f"  TOTAL INPUT:        {total_in:<5}  |  SKIPPED (COOLDOWN): {skip_cnt:<5}",
+            f"  NEW RECIPIENTS:     {new_rec:<5}  |  UNDELIVERED REVIEW: {rev_cnt:<5}",
+            f"  SENT:               {sent_cnt:<5}  |  INVALID:            {inv_cnt:<5}",
+            f"  UNDELIVERED:        {undeliv_cnt:<5}  |  FAILED TO SUBMIT:   {fail_cnt:<5}",
         ])
 
         if self.lines_rendered > 0:
@@ -1100,7 +1139,6 @@ class LiveDashboard:
             self._render_locked(force=True)
             elapsed = max(0.001, time.time() - self.start_time)
             rate = (self.completed / elapsed) * 60.0
-            pct = (self.completed / self.total_recipients * 100.0) if self.total_recipients > 0 else 100.0
             mins, secs = divmod(int(elapsed), 60)
             elapsed_str = f"{mins:02d}:{secs:02d}"
 
@@ -1112,64 +1150,71 @@ class LiveDashboard:
             failed_cnt = self.counters.get('FAILED_TO_SUBMIT', 0)
             new_cnt = self.counters.get('NEW_RECIPIENTS', 0)
 
-            cd_str = f"ENABLED ({self.cooldown_days}-Day Cooldown)" if self.cooldown_enabled else "DISABLED"
-
+            divider = "―" * 52
             summary = [
                 "",
-                "=========================== Final Execution Summary ===========================",
-                f"Duplicate Check:      {cd_str}",
-                f"Total Input:          {self.total_recipients}",
-                f"New Recipients:       {new_cnt}",
-                f"Processed:            {self.completed}",
-                f"Progress:             {pct:.1f}%",
-                f"Elapsed Time:         {elapsed_str}",
-                f"Processing Rate:      {rate:.1f} emails/min",
-                "",
-                "--- Status Counters ---",
+                "Final Execution Summary",
+                divider,
                 f"TOTAL INPUT:          {self.total_recipients}",
                 f"NEW RECIPIENTS:       {new_cnt}",
-                f"SKIPPED ({self.cooldown_days}-DAY COOLDOWN): {skipped_cnt}",
+                f"SENT:                 {sent_cnt}",
+                f"UNDELIVERED:          {undelivered_cnt}",
+                f"COOLDOWN SKIPPED ({self.cooldown_days}-DAY COOLDOWN): {skipped_cnt}",
                 f"UNDELIVERED REVIEW:   {review_cnt}",
                 f"INVALID:              {invalid_cnt}",
                 f"FAILED TO SUBMIT:     {failed_cnt}",
-                f"SENT:                 {sent_cnt}",
-                f"UNDELIVERED:          {undelivered_cnt}"
             ]
 
+            # Cooldown skipped details (only shown when non-empty)
             if self.skipped_cooldown_recipients:
                 summary.append("")
-                summary.append(f"--- Skipped Recipients ({self.cooldown_days}-Day Cooldown) ---")
+                summary.append(f"Cooldown Skipped ({self.cooldown_days}-Day Cooldown)")
                 for s in self.skipped_cooldown_recipients:
-                    summary.append(f"  - {s['recipient']}: Previous Submission: {s.get('submitted_date', 'N/A')} | Eligible Again: {s.get('eligible_date', 'N/A')}")
+                    rec_email = format_display_text(s.get('recipient', ''))
+                    sub_date = s.get('submitted_date', 'N/A')
+                    elig_date = s.get('eligible_date', 'N/A')
+                    summary.append(f"  • {rec_email}: Previous Submission: {sub_date} | Eligible Again: {elig_date}")
 
-            if self.undelivered_review_recipients:
-                summary.append("")
-                summary.append("--- Undelivered Review (Flagged for Manual Review) ---")
-                for u in self.undelivered_review_recipients:
-                    summary.append(f"  - {u['recipient']}: Status: {u.get('status', 'UNDELIVERED')}")
-
+            # Undelivered details (only shown when non-empty)
             undelivered = undelivered_recipients if undelivered_recipients is not None else self.undelivered_recipients
             if undelivered:
                 summary.append("")
-                summary.append("--- Undelivered Recipients ---")
+                summary.append("Undelivered (Confirmed Bounces)")
                 for u in undelivered:
-                    summary.append(f"Recipient: {u['recipient']}")
-                    summary.append(f"Status: {u['status']}")
+                    rec_email = format_display_text(u.get('recipient', ''))
+                    status_clean = format_display_text(u.get('status', 'UNDELIVERED'))
+                    summary.append(f"  • Recipient: {rec_email}")
+                    summary.append(f"    Status: {status_clean}")
 
+            # Undelivered review details (only shown when non-empty)
+            if self.undelivered_review_recipients:
+                summary.append("")
+                summary.append("Undelivered Review (Prior Bounces Flagged for Review)")
+                for u in self.undelivered_review_recipients:
+                    rec_email = format_display_text(u.get('recipient', ''))
+                    status_clean = format_display_text(u.get('status', 'UNDELIVERED'))
+                    summary.append(f"  • Recipient: {rec_email}")
+                    summary.append(f"    Status: {status_clean}")
+
+            # Execution error details (only shown when non-empty)
             errs = execution_errors if execution_errors is not None else self.execution_errors
             if errs:
                 summary.append("")
-                summary.append("--- Execution Error Details ---")
+                summary.append("Execution Errors")
                 for e in errs:
-                    summary.append(f"  - {e['recipient']}: {e.get('error', 'Error')}")
+                    rec_email = format_display_text(e.get('recipient', ''))
+                    err_clean = format_display_text(e.get('error', 'Error'))
+                    summary.append(f"  • {rec_email}: {err_clean}")
 
+            # Compact footer
             summary.extend([
                 "",
-                f"Logs:                 {log_path}",
-                f"Public Directory:     {excel_path}",
-                "===============================================================================",
+                divider,
+                f"Elapsed: {elapsed_str}  •  Rate: {rate:.1f} msg/min  •  Log: {log_path}  •  Directory: {excel_path}",
+                divider,
                 ""
             ])
+            print("\n".join(summary))
             print("\n".join(summary))
 
 
@@ -1992,12 +2037,10 @@ def main():
     logger = OutreachLogger(config.log_file) if config.logging_enabled else None
     directory = RecruiterDirectory(config.excel_directory_file) if config.excel_directory_enabled else None
 
-    # Startup status banner reflecting active settings
-    cd_status = f"ENABLED ({config.duplicate_cooldown_days}-Day Cooldown)" if config.duplicate_check_enabled else "DISABLED"
-    print("===============================================================================")
-    print(f"[*] Starting Recruiter Gmail Outreach Agent")
-    print(f"[*] Config: Workers={config.num_workers} | Duplicate Check={cd_status} | Dry Run={config.dry_run}")
-    print("===============================================================================")
+    # Compact startup header
+    cd_info = f"{config.duplicate_cooldown_days}d cooldown" if config.duplicate_check_enabled else "disabled"
+    dry_info = "DRY RUN (Simulated)" if config.dry_run else "LIVE"
+    print(f"Recruiter Gmail Outreach Agent  •  Workers: {config.num_workers}  •  Duplicate Check: {cd_info}  •  Mode: {dry_info}\n")
 
     # 1. Check prerequisite files & parse template
     if not os.path.exists(config.resume_file):
@@ -2105,8 +2148,6 @@ def main():
         except Exception as e:
             print(f"Authentication failed: {e}")
             return
-    elif config.dry_run:
-        print("Note: Running in DRY_RUN mode. Real emails will not be sent.")
 
     # 5. Initialize dashboard if enabled
     dashboard = None
@@ -2211,42 +2252,50 @@ def main():
             excel_path=config.excel_directory_file if config.excel_directory_enabled else "Disabled"
         )
     else:
-        print("\n=== Final Execution Summary ===")
-        print(f"Duplicate Check:      {cd_status}")
-        print(f"Total Input:          {total_recipients}")
-        print(f"New Recipients:       {len(eligible_recipients)}")
-        print(f"SKIPPED ({config.duplicate_cooldown_days}-DAY COOLDOWN):   {len(skipped_cooldown_records)}")
+        divider = "―" * 52
+        print("\nFinal Execution Summary")
+        print(divider)
+        print(f"TOTAL INPUT:          {total_recipients}")
+        print(f"NEW RECIPIENTS:       {len(eligible_recipients)}")
+        print(f"SENT:                 {sent_count}")
+        print(f"UNDELIVERED:          {undelivered_count}")
+        print(f"COOLDOWN SKIPPED ({config.duplicate_cooldown_days}-DAY COOLDOWN): {len(skipped_cooldown_records)}")
         print(f"UNDELIVERED REVIEW:   {len(undelivered_review_records)}")
         print(f"INVALID:              {len(invalid_records)}")
         print(f"FAILED TO SUBMIT:     {failed_submit_count}")
-        print(f"SENT:                 {sent_count}")
-        print(f"UNDELIVERED:          {undelivered_count}")
 
         if skipped_cooldown_records:
-            print(f"\n--- Skipped Recipients ({config.duplicate_cooldown_days}-Day Cooldown) ---")
+            print(f"\nCooldown Skipped ({config.duplicate_cooldown_days}-Day Cooldown)")
             for scr in skipped_cooldown_records:
-                print(f"  - {scr['recipient']}: Previous Submission: {scr['submitted_date']} | Eligible Again: {scr['eligible_date']}")
-
-        if undelivered_review_records:
-            print("\n--- Undelivered Review (Flagged for Manual Review) ---")
-            for urr in undelivered_review_records:
-                print(f"  - {urr['recipient']}: Status: {urr['status']}")
+                rec_email = format_display_text(scr.get('recipient', ''))
+                print(f"  • {rec_email}: Previous Submission: {scr['submitted_date']} | Eligible Again: {scr['eligible_date']}")
 
         if undelivered_records:
-            print("\n--- Undelivered Recipients ---")
+            print("\nUndelivered (Confirmed Bounces)")
             for ur in undelivered_records:
-                print(f"Recipient: {ur['recipient']}")
-                print(f"Status: {ur['status']}")
+                rec_email = format_display_text(ur.get('recipient', ''))
+                status_clean = format_display_text(ur.get('status', 'UNDELIVERED'))
+                print(f"  • Recipient: {rec_email}")
+                print(f"    Status: {status_clean}")
+
+        if undelivered_review_records:
+            print("\nUndelivered Review (Prior Bounces Flagged for Review)")
+            for urr in undelivered_review_records:
+                rec_email = format_display_text(urr.get('recipient', ''))
+                status_clean = format_display_text(urr.get('status', 'UNDELIVERED'))
+                print(f"  • Recipient: {rec_email}")
+                print(f"    Status: {status_clean}")
 
         if execution_errors:
-            print("\n--- Execution Error Details ---")
+            print("\nExecution Errors")
             for ee in execution_errors:
-                print(f"  - {ee['recipient']}: {ee.get('error', 'Error')}")
+                rec_email = format_display_text(ee.get('recipient', ''))
+                err_clean = format_display_text(ee.get('error', 'Error'))
+                print(f"  • {rec_email}: {err_clean}")
 
-        if config.logging_enabled:
-            print(f"\nLogs:                 {config.log_file}")
-        if config.excel_directory_enabled:
-            print(f"Public Directory:     {config.excel_directory_file}")
+        print("\n" + divider)
+        print(f"Log: {config.log_file if config.logging_enabled else 'Disabled'}  •  Directory: {config.excel_directory_file if config.excel_directory_enabled else 'Disabled'}")
+        print(divider + "\n")
 
 
 if __name__ == '__main__':
