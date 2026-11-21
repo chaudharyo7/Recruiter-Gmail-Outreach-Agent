@@ -2036,7 +2036,53 @@ class TestRecruiterOutreachAgent(unittest.TestCase):
             if os.path.exists(tmp_csv2):
                 os.remove(tmp_csv2)
 
-        print("[PASS] CSV auto-clearing and crash recovery verified (header preserved, safe rows cleared, uncertain rows retained)")
+        # 3. Verify process_recipients_concurrently preserves failed-to-submit emails from safely_processed_set
+        with tempfile.NamedTemporaryFile('w', newline='', suffix='.csv', delete=False) as f:
+            writer = csv.writer(f)
+            writer.writerow(['email'])
+            writer.writerow(['success@example.com'])
+            writer.writerow(['failed@example.com'])
+            tmp_csv3 = f.name
+
+        try:
+            from googleapiclient.errors import HttpError
+            mock_service = MagicMock()
+            def mock_send(userId, body):
+                raw_bytes = base64.urlsafe_b64decode(body.get('raw', '').encode('utf-8'))
+                m = MagicMock()
+                if b'failed@example.com' in raw_bytes:
+                    resp = httplib2.Response({'status': 500, 'reason': 'Internal Server Error'})
+                    m.execute.side_effect = HttpError(resp, b'{"error": {"message": "Server Error"}}')
+                else:
+                    m.execute.return_value = {'id': 'success_id'}
+                return m
+
+            mock_service.users().messages().send.side_effect = mock_send
+
+            test_safely_processed = set()
+            process_recipients_concurrently(
+                recipients=['success@example.com', 'failed@example.com'],
+                service=mock_service,
+                subject='Test',
+                html_template='<p>Test</p>',
+                resume_path=DEFAULT_RESUME,
+                num_workers=1,
+                safely_processed_set=test_safely_processed,
+                api_call_delay=0.0
+            )
+
+            self.assertIn('success@example.com', test_safely_processed)
+            self.assertNotIn('failed@example.com', test_safely_processed)
+
+            # Clearing queue with this set preserves failed@example.com
+            safe_clear_csv_queue(tmp_csv3, test_safely_processed)
+            remaining_raw = read_raw_recruiter_emails(tmp_csv3)
+            self.assertEqual(remaining_raw, ['failed@example.com'], "Failed emails must be retained in CSV queue")
+        finally:
+            if os.path.exists(tmp_csv3):
+                os.remove(tmp_csv3)
+
+        print("[PASS] CSV auto-clearing and crash recovery verified (header preserved, safe rows cleared, uncertain rows retained, failed sends kept in CSV)")
 
     def test_30_full_pipeline_duplicate_prevention_and_dashboard(self):
         """Verify full end-to-end pipeline:
