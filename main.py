@@ -1573,7 +1573,13 @@ def execute_with_retry(
             return api_call_fn()
         except HttpError as error:
             status_code = getattr(getattr(error, 'resp', None), 'status', None)
-            if status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+            is_quota_rate_limit = False
+            if status_code == 403:
+                err_text = str(error).lower()
+                if 'quota' in err_text or 'rate' in err_text or 'limit' in err_text:
+                    is_quota_rate_limit = True
+
+            if (status_code in (429, 500, 502, 503, 504) or is_quota_rate_limit) and attempt < max_retries:
                 time.sleep(delay)
                 delay *= backoff_factor
                 last_err = error
@@ -1862,8 +1868,7 @@ def process_recipients_concurrently(
                 if logging_active:
                     with log_lock:
                         logger.log_email_record(rec)
-                if safely_processed_set is not None:
-                    safely_processed_set.add(lower_email)
+                # Keep invalid format emails in CSV queue so the user can inspect and correct them
                 with records_lock:
                     all_records.append(rec)
                 if dashboard:
@@ -1976,8 +1981,7 @@ def process_recipients_concurrently(
                     with log_lock:
                         logger.log_email_record(rec)
 
-                if safely_processed_set is not None:
-                    safely_processed_set.add(lower_email)
+                # Do not mark as safely processed: emails that failed to send are preserved in CSV for retry
 
                 with records_lock:
                     all_records.append(rec)
@@ -2000,8 +2004,7 @@ def process_recipients_concurrently(
                     with log_lock:
                         logger.log_email_record(rec)
 
-                if safely_processed_set is not None:
-                    safely_processed_set.add(lower_email)
+                # Do not mark as safely processed: emails that failed to send are preserved in CSV for retry
 
                 with records_lock:
                     all_records.append(rec)
@@ -2133,7 +2136,7 @@ def main():
             if logger and config.logging_enabled:
                 logger.log_email_record(inv_rec)
             invalid_records.append(inv_rec)
-            safely_processed.add(r_lower)
+            # Do not add to safely_processed: keep in CSV queue so user can correct any typo or invalid address
         else: # SEND
             eligible_recipients.append(r_clean)
 
